@@ -31,16 +31,25 @@ STATE_FILE = "state.json"
 
 
 # ================== TELEGRAM ==================
-def tg_send(text: str) -> None:
+def tg_send(text: str, chat_id: Optional[int] = None) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     r = requests.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        json={"chat_id": chat_id or TELEGRAM_CHAT_ID, "text": text},
         timeout=15
     )
     # Если Telegram вернул ошибку — покажем в консоли
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+
+
+def tg_get_updates(offset: int) -> List[Dict]:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    r = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+    data = r.json()
+    return data.get("result", [])
 
 
 # ================== STATE ==================
@@ -55,6 +64,114 @@ def load_state() -> Dict:
 def save_state(state: Dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def normalize_symbol(symbol: str) -> str:
+    return symbol.split("/")[0]
+
+
+def format_pairs(separator: str) -> str:
+    return separator.join([normalize_symbol(s) for s in SYMBOLS])
+
+
+def format_last_signal(last_signal: Optional[Dict]) -> str:
+    if not last_signal:
+        return "📈 Последний сигнал:\nПока нет сигналов"
+
+    direction_map = {"UP": "ВВЕРХ", "DOWN": "ВНИЗ"}
+    direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
+    return (
+        "📈 Последний сигнал:\n"
+        f"Пара: {last_signal.get('pair', '')}\n"
+        f"Направление: {direction}\n"
+        f"Вероятность: {last_signal.get('confidence', '')}%\n"
+        f"Цена: {last_signal.get('price', '')}"
+    )
+
+
+def handle_command(text: str, chat_id: int, exchange: ccxt.bybit, state: Dict) -> None:
+    global MIN_CONFIDENCE
+    parts = text.strip().split()
+    if not parts:
+        return
+
+    command = parts[0].lower()
+
+    if command == "/start":
+        tg_send(
+            "🤖 Crypto Signal Bot запущен\n"
+            f"Пары: {format_pairs(' / ')}\n"
+            f"TF: {TIMEFRAME}",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/status":
+        tg_send(
+            "📊 Статус бота:\n"
+            f"Пары: {format_pairs(', ')}\n"
+            f"TF: {TIMEFRAME}\n"
+            f"Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
+            f"Мин. вероятность: {MIN_CONFIDENCE}%",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/signals":
+        tg_send(format_last_signal(state.get("last_signal")), chat_id=chat_id)
+        return
+
+    if command == "/confidence":
+        tg_send(f"🎯 Минимальная вероятность сигнала: {MIN_CONFIDENCE}%", chat_id=chat_id)
+        return
+
+    if command == "/help":
+        tg_send(
+            "📖 Доступные команды:\n"
+            "/start\n"
+            "/status\n"
+            "/signals\n"
+            "/confidence\n"
+            "/help\n"
+            "/setconfidence 65\n"
+            "/pause\n"
+            "/resume\n"
+            "/now",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/setconfidence":
+        if len(parts) == 2 and parts[1].isdigit():
+            value = int(parts[1])
+            if 0 <= value <= 100:
+                MIN_CONFIDENCE = value
+                state["min_confidence"] = value
+                save_state(state)
+                tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
+                return
+        tg_send("❌ Используй: /setconfidence 65", chat_id=chat_id)
+        return
+
+    if command == "/pause":
+        state["paused"] = True
+        save_state(state)
+        tg_send("⏸️ Сигналы на паузе", chat_id=chat_id)
+        return
+
+    if command == "/resume":
+        state["paused"] = False
+        save_state(state)
+        tg_send("▶️ Сигналы включены", chat_id=chat_id)
+        return
+
+    if command == "/now":
+        last_signal = run_signal_cycle(exchange, state, send_signals=False, allow_cooldown=False)
+        if last_signal:
+            tg_send(format_last_signal(last_signal), chat_id=chat_id)
+        else:
+            tg_send("🔎 Сейчас сигнала нет", chat_id=chat_id)
+        return
 
 
 # ================== INDICATORS ==================
@@ -150,8 +267,66 @@ def compute_signal(closes: List[float]) -> Tuple[Optional[str], Dict]:
     return None, info
 
 
+def run_signal_cycle(
+    exchange: ccxt.bybit,
+    state: Dict,
+    send_signals: bool,
+    allow_cooldown: bool = True,
+) -> Optional[Dict]:
+    last_signal = None
+    for symbol in SYMBOLS:
+        try:
+            candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
+            closes = [c[4] for c in candles]
+
+            signal, info = compute_signal(closes)
+
+            if not signal:
+                continue
+
+            key = f"{symbol}_{signal}"
+            last_time = state.get(key, 0)
+
+            if allow_cooldown and time.time() - last_time < COOLDOWN_MINUTES * 60:
+                continue
+
+            direction_text = "📈 Потенциальное ПОВЫШЕНИЕ" if signal == "UP" else "📉 Потенциальное ПОНИЖЕНИЕ"
+
+            msg = (
+                f"{direction_text}\n"
+                f"Пара: {symbol}\n"
+                f"TF: {TIMEFRAME}\n"
+                f"Цена: {info['price']}\n"
+                f"Вверх: {info['up_pct']}% | Вниз: {info['down_pct']}%\n"
+                f"EMA50: {round(info['ema50'], 6)}\n"
+                f"EMA200: {round(info['ema200'], 6)}\n"
+                f"RSI14: {round(info['rsi'], 2)}\n"
+                f"Уверенность: {info['confidence']}%"
+            )
+
+            if send_signals:
+                tg_send(msg)
+
+            last_signal = {
+                "pair": normalize_symbol(symbol),
+                "direction": signal,
+                "confidence": info["confidence"],
+                "price": info["price"],
+            }
+            state["last_signal"] = last_signal
+            state[key] = time.time()
+            save_state(state)
+
+        except Exception as e:
+            # Покажем ошибку в консоли, чтобы ты видел, что не так
+            print(f"[{symbol}] ERROR: {e}")
+
+    return last_signal
+
+
 # ================== MAIN ==================
 def main() -> None:
+    global MIN_CONFIDENCE
     exchange = ccxt.bybit({
         "apiKey": BYBIT_API_KEY,
         "secret": BYBIT_API_SECRET,
@@ -160,6 +335,12 @@ def main() -> None:
     })
 
     state = load_state()
+    state.setdefault("min_confidence", MIN_CONFIDENCE)
+    state.setdefault("paused", False)
+    state.setdefault("last_signal", None)
+    save_state(state)
+    MIN_CONFIDENCE = state.get("min_confidence", MIN_CONFIDENCE)
+    update_offset = 0
 
     # Сообщение при старте (должно прийти всегда)
     tg_send(
@@ -171,43 +352,25 @@ def main() -> None:
     )
 
     while True:
-        for symbol in SYMBOLS:
-            try:
-                candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
-                closes = [c[4] for c in candles]
-
-                signal, info = compute_signal(closes)
-
-                if not signal:
+        try:
+            updates = tg_get_updates(update_offset)
+            for update in updates:
+                update_offset = max(update_offset, update.get("update_id", 0) + 1)
+                message = update.get("message")
+                if not message:
                     continue
-
-                key = f"{symbol}_{signal}"
-                last_time = state.get(key, 0)
-
-                if time.time() - last_time < COOLDOWN_MINUTES * 60:
+                chat = message.get("chat", {})
+                chat_id = chat.get("id")
+                text = message.get("text", "")
+                if chat_id != TELEGRAM_CHAT_ID:
                     continue
+                if text.startswith("/"):
+                    handle_command(text, chat_id, exchange, state)
+        except Exception as e:
+            print(f"[telegram] ERROR: {e}")
 
-                direction_text = "📈 Потенциальное ПОВЫШЕНИЕ" if signal == "UP" else "📉 Потенциальное ПОНИЖЕНИЕ"
-
-                msg = (
-                    f"{direction_text}\n"
-                    f"Пара: {symbol}\n"
-                    f"TF: {TIMEFRAME}\n"
-                    f"Цена: {info['price']}\n"
-                    f"Вверх: {info['up_pct']}% | Вниз: {info['down_pct']}%\n"
-                    f"EMA50: {round(info['ema50'], 6)}\n"
-                    f"EMA200: {round(info['ema200'], 6)}\n"
-                    f"RSI14: {round(info['rsi'], 2)}\n"
-                    f"Уверенность: {info['confidence']}%"
-                )
-
-                tg_send(msg)
-                state[key] = time.time()
-                save_state(state)
-
-            except Exception as e:
-                # Покажем ошибку в консоли, чтобы ты видел, что не так
-                print(f"[{symbol}] ERROR: {e}")
+        if not state.get("paused"):
+            run_signal_cycle(exchange, state, send_signals=True)
 
         time.sleep(CHECK_EVERY_SECONDS)
 
