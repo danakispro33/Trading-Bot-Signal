@@ -1,5 +1,6 @@
 import time
 import json
+import threading
 from typing import List, Dict, Optional, Tuple
 
 import ccxt
@@ -28,6 +29,8 @@ COOLDOWN_MINUTES = 90
 MIN_CONFIDENCE = 62
 
 STATE_FILE = "state.json"
+state_lock = threading.Lock()
+run_now_request = {"chat_id": None}
 
 
 # ================== TELEGRAM ==================
@@ -45,7 +48,7 @@ def tg_send(text: str, chat_id: Optional[int] = None) -> None:
 
 def tg_get_updates(offset: int) -> List[Dict]:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    r = requests.get(url, params={"offset": offset, "timeout": 10}, timeout=15)
+    r = requests.get(url, params={"offset": offset, "timeout": 15}, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
     data = r.json()
@@ -89,7 +92,7 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
     )
 
 
-def handle_command(text: str, chat_id: int, exchange: ccxt.bybit, state: Dict) -> None:
+def handle_command(text: str, chat_id: int, state: Dict) -> None:
     global MIN_CONFIDENCE
     parts = text.strip().split()
     if not parts:
@@ -118,7 +121,9 @@ def handle_command(text: str, chat_id: int, exchange: ccxt.bybit, state: Dict) -
         return
 
     if command == "/signals":
-        tg_send(format_last_signal(state.get("last_signal")), chat_id=chat_id)
+        with state_lock:
+            last_signal = state.get("last_signal")
+        tg_send(format_last_signal(last_signal), chat_id=chat_id)
         return
 
     if command == "/confidence":
@@ -145,32 +150,32 @@ def handle_command(text: str, chat_id: int, exchange: ccxt.bybit, state: Dict) -
         if len(parts) == 2 and parts[1].isdigit():
             value = int(parts[1])
             if 0 <= value <= 100:
-                MIN_CONFIDENCE = value
-                state["min_confidence"] = value
-                save_state(state)
+                with state_lock:
+                    MIN_CONFIDENCE = value
+                    state["min_confidence"] = value
+                    save_state(state)
                 tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
                 return
         tg_send("❌ Используй: /setconfidence 65", chat_id=chat_id)
         return
 
     if command == "/pause":
-        state["paused"] = True
-        save_state(state)
+        with state_lock:
+            state["paused"] = True
+            save_state(state)
         tg_send("⏸️ Сигналы на паузе", chat_id=chat_id)
         return
 
     if command == "/resume":
-        state["paused"] = False
-        save_state(state)
+        with state_lock:
+            state["paused"] = False
+            save_state(state)
         tg_send("▶️ Сигналы включены", chat_id=chat_id)
         return
 
     if command == "/now":
-        last_signal = run_signal_cycle(exchange, state, send_signals=False, allow_cooldown=False)
-        if last_signal:
-            tg_send(format_last_signal(last_signal), chat_id=chat_id)
-        else:
-            tg_send("🔎 Сейчас сигнала нет", chat_id=chat_id)
+        with state_lock:
+            run_now_request["chat_id"] = chat_id
         return
 
 
@@ -285,7 +290,8 @@ def run_signal_cycle(
                 continue
 
             key = f"{symbol}_{signal}"
-            last_time = state.get(key, 0)
+            with state_lock:
+                last_time = state.get(key, 0)
 
             if allow_cooldown and time.time() - last_time < COOLDOWN_MINUTES * 60:
                 continue
@@ -313,9 +319,10 @@ def run_signal_cycle(
                 "confidence": info["confidence"],
                 "price": info["price"],
             }
-            state["last_signal"] = last_signal
-            state[key] = time.time()
-            save_state(state)
+            with state_lock:
+                state["last_signal"] = last_signal
+                state[key] = time.time()
+                save_state(state)
 
         except Exception as e:
             # Покажем ошибку в консоли, чтобы ты видел, что не так
@@ -325,31 +332,9 @@ def run_signal_cycle(
 
 
 # ================== MAIN ==================
-def main() -> None:
-    global MIN_CONFIDENCE
-    exchange = ccxt.bybit({
-        "apiKey": BYBIT_API_KEY,
-        "secret": BYBIT_API_SECRET,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},  # фьючерсы (USDT Perpetual)
-    })
-
-    state = load_state()
-    state.setdefault("min_confidence", MIN_CONFIDENCE)
-    state.setdefault("paused", False)
-    state.setdefault("last_signal", None)
-    save_state(state)
-    MIN_CONFIDENCE = state.get("min_confidence", MIN_CONFIDENCE)
+def command_loop(state: Dict) -> None:
     update_offset = 0
-
-    # Сообщение при старте (должно прийти всегда)
-    tg_send(
-        "🤖 Бот запущен.\n"
-        "Монеты: XRP / SOL / BTC\n"
-        "TF: 15m\n"
-        f"Мин. уверенность: {MIN_CONFIDENCE}%\n"
-        f"Антиспам: {COOLDOWN_MINUTES} мин"
-    )
+    print("Command loop started")
 
     while True:
         try:
@@ -365,14 +350,74 @@ def main() -> None:
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
                 if text.startswith("/"):
-                    handle_command(text, chat_id, exchange, state)
+                    handle_command(text, chat_id, state)
         except Exception as e:
             print(f"[telegram] ERROR: {e}")
 
-        if not state.get("paused"):
-            run_signal_cycle(exchange, state, send_signals=True)
+        time.sleep(1)
 
-        time.sleep(CHECK_EVERY_SECONDS)
+
+def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
+    print("Signal loop started")
+    next_run = time.time()
+
+    while True:
+        run_now_chat_id = None
+        with state_lock:
+            run_now_chat_id = run_now_request.get("chat_id")
+            if run_now_chat_id is not None:
+                run_now_request["chat_id"] = None
+
+        if run_now_chat_id is not None:
+            last_signal = run_signal_cycle(exchange, state, send_signals=False, allow_cooldown=False)
+            if last_signal:
+                tg_send(format_last_signal(last_signal), chat_id=run_now_chat_id)
+            else:
+                tg_send("🔎 Сейчас сигнала нет", chat_id=run_now_chat_id)
+
+        with state_lock:
+            paused = state.get("paused", False)
+
+        if not paused and time.time() >= next_run:
+            run_signal_cycle(exchange, state, send_signals=True)
+            next_run = time.time() + CHECK_EVERY_SECONDS
+
+        time.sleep(1)
+
+
+def main() -> None:
+    global MIN_CONFIDENCE
+    exchange = ccxt.bybit({
+        "apiKey": BYBIT_API_KEY,
+        "secret": BYBIT_API_SECRET,
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},  # фьючерсы (USDT Perpetual)
+    })
+
+    with state_lock:
+        state = load_state()
+        state.setdefault("min_confidence", MIN_CONFIDENCE)
+        state.setdefault("paused", False)
+        state.setdefault("last_signal", None)
+        save_state(state)
+        MIN_CONFIDENCE = state.get("min_confidence", MIN_CONFIDENCE)
+
+    # Сообщение при старте (должно прийти всегда)
+    tg_send(
+        "🤖 Бот запущен.\n"
+        "Монеты: XRP / SOL / BTC\n"
+        "TF: 15m\n"
+        f"Мин. уверенность: {MIN_CONFIDENCE}%\n"
+        f"Антиспам: {COOLDOWN_MINUTES} мин"
+    )
+
+    command_thread = threading.Thread(target=command_loop, args=(state,), daemon=True)
+    signal_thread = threading.Thread(target=signal_loop, args=(exchange, state), daemon=True)
+    command_thread.start()
+    signal_thread.start()
+
+    while True:
+        time.sleep(5)
 
 
 if __name__ == "__main__":
