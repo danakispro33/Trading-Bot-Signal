@@ -5,6 +5,7 @@ from typing import List, Dict, Optional, Tuple
 
 import ccxt
 import requests
+from probability_engine import format_percent, get_probability, load_stats, make_key
 
 
 # ================== ТВОИ ДАННЫЕ ==================
@@ -297,6 +298,11 @@ def run_signal_cycle(
                 continue
 
             direction_text = "📈 Потенциальное ПОВЫШЕНИЕ" if signal == "UP" else "📉 Потенциальное ПОНИЖЕНИЕ"
+            stats = load_stats()
+            min_samples = stats.get("meta", {}).get("min_samples", 50)
+            side = "LONG" if signal == "UP" else "SHORT"
+            probability_key = make_key(symbol, TIMEFRAME, side)
+            probability = get_probability(probability_key, min_samples=min_samples)
 
             msg = (
                 f"{direction_text}\n"
@@ -306,9 +312,12 @@ def run_signal_cycle(
                 f"Вверх: {info['up_pct']}% | Вниз: {info['down_pct']}%\n"
                 f"EMA50: {round(info['ema50'], 6)}\n"
                 f"EMA200: {round(info['ema200'], 6)}\n"
-                f"RSI14: {round(info['rsi'], 2)}\n"
-                f"Уверенность: {info['confidence']}%"
+                f"RSI14: {round(info['rsi'], 2)}"
             )
+            if probability is not None:
+                msg += f"\nВероятность (по статистике): {format_percent(probability, 2)}"
+            else:
+                msg += "\nВероятность (по статистике): недостаточно данных"
 
             if send_signals:
                 tg_send(msg)
