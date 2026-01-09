@@ -5,7 +5,7 @@ from typing import List, Dict, Optional, Tuple
 
 import ccxt
 import requests
-from probability_engine import format_percent, get_probability, load_stats, make_key
+from probability_engine import get_probability, load_stats, make_key
 
 
 # ================== ТВОИ ДАННЫЕ ==================
@@ -91,6 +91,15 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
         f"Вероятность: {last_signal.get('confidence', '')}%\n"
         f"Цена: {last_signal.get('price', '')}"
     )
+
+
+def probability_bar(p: float, length: int = 10) -> str:
+    try:
+        filled = int(p * length)  # строго вниз, без round
+        filled = max(0, min(length, filled))
+        return "▰" * filled + "▱" * (length - filled)
+    except Exception:
+        return "▱" * length
 
 
 def handle_command(text: str, chat_id: int, state: Dict) -> None:
@@ -297,27 +306,32 @@ def run_signal_cycle(
             if allow_cooldown and time.time() - last_time < COOLDOWN_MINUTES * 60:
                 continue
 
-            direction_text = "📈 Потенциальное ПОВЫШЕНИЕ" if signal == "UP" else "📉 Потенциальное ПОНИЖЕНИЕ"
             stats = load_stats()
             min_samples = stats.get("meta", {}).get("min_samples", 50)
             side = "LONG" if signal == "UP" else "SHORT"
             probability_key = make_key(symbol, TIMEFRAME, side)
             probability = get_probability(probability_key, min_samples=min_samples)
 
-            msg = (
-                f"{direction_text}\n"
-                f"Пара: {symbol}\n"
-                f"TF: {TIMEFRAME}\n"
-                f"Цена: {info['price']}\n"
-                f"Вверх: {info['up_pct']}% | Вниз: {info['down_pct']}%\n"
-                f"EMA50: {round(info['ema50'], 6)}\n"
-                f"EMA200: {round(info['ema200'], 6)}\n"
-                f"RSI14: {round(info['rsi'], 2)}"
-            )
             if probability is not None:
-                msg += f"\nВероятность (по статистике): {format_percent(probability, 2)}"
+                prob_line = f"{probability_bar(probability)} {probability*100:.2f}%"
             else:
-                msg += "\nВероятность (по статистике): недостаточно данных"
+                prob_line = "недостаточно данных"
+
+            price = info["price"]
+            timeframe = TIMEFRAME
+
+            msg = (
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📈 ТОРГОВЫЙ СИГНАЛ\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🪙 Пара: {symbol} / USDT\n"
+                f"📍 Направление: {'ВВЕРХ ⬆️' if side == 'LONG' else 'ВНИЗ ⬇️'}\n"
+                f"💰 Цена входа: {price}\n\n"
+                "🎯 Вероятность успеха\n"
+                f"{prob_line}\n\n"
+                f"⏱ Таймфрейм: {timeframe}\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
 
             if send_signals:
                 tg_send(msg)
