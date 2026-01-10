@@ -102,6 +102,18 @@ def probability_bar(p: float, length: int = 10) -> str:
         return "▱" * length
 
 
+def compute_display_probability(probability: Optional[float], info: Dict) -> float:
+    if probability is not None:
+        return min(max(probability, 0.01), 1.0)
+
+    confidence = info.get("confidence")
+    if confidence is None:
+        return 0.01
+
+    fallback = max(float(confidence), 1.0) / 100
+    return min(max(fallback, 0.01), 1.0)
+
+
 def handle_command(text: str, chat_id: int, state: Dict) -> None:
     global MIN_CONFIDENCE
     parts = text.strip().split()
@@ -311,11 +323,8 @@ def run_signal_cycle(
             side = "LONG" if signal == "UP" else "SHORT"
             probability_key = make_key(symbol, TIMEFRAME, side)
             probability = get_probability(probability_key, min_samples=min_samples)
-
-            if probability is not None:
-                prob_line = f"{probability_bar(probability)} {probability*100:.2f}%"
-            else:
-                prob_line = "недостаточно данных"
+            display_probability = compute_display_probability(probability, info)
+            prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
 
             price = info["price"]
             timeframe = TIMEFRAME
