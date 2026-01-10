@@ -19,9 +19,16 @@ BYBIT_API_SECRET = ""
 
 # ================== НАСТРОЙКИ ==================
 SYMBOLS = [
+    "BTC/USDT:USDT",
     "XRP/USDT:USDT",
     "SOL/USDT:USDT",
-    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "BNB/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "DOT/USDT:USDT",
+    "XLM/USDT:USDT",
 ]
 
 TIMEFRAME = "15m"
@@ -436,11 +443,11 @@ def main() -> None:
 
     # Сообщение при старте (должно прийти всегда)
     tg_send(
-        "🤖 Бот запущен.\n"
-        "Монеты: XRP / SOL / BTC\n"
-        "TF: 15m\n"
-        f"Мин. уверенность: {MIN_CONFIDENCE}%\n"
-        f"Антиспам: {COOLDOWN_MINUTES} мин"
+        "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
+        f"🧠 Анализ активов: {len(SYMBOLS)}\n"
+        f"⏱ Таймфрейм: {TIMEFRAME}\n"
+        f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
+        f"🛡 Антиспам: {COOLDOWN_MINUTES} мин"
     )
 
     command_thread = threading.Thread(target=command_loop, args=(state,), daemon=True)
