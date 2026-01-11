@@ -2,9 +2,11 @@ import time
 import json
 import threading
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
 
 import ccxt
+import pandas as pd
 import requests
 from probability_engine import get_probability, load_stats, make_key
 
@@ -43,16 +45,23 @@ run_now_request = {"chat_id": None}
 
 
 # ================== TELEGRAM ==================
-def tg_send(text: str, chat_id: Optional[int] = None) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(
-        url,
-        json={"chat_id": chat_id or TELEGRAM_CHAT_ID, "text": text},
-        timeout=15
-    )
-    # Если Telegram вернул ошибку — покажем в консоли
-    if r.status_code != 200:
-        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+def tg_send(text: str, chat_id: Optional[int] = None) -> bool:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": chat_id or TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"[TG] sendMessage failed: {r.status_code} {r.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[TG] sendMessage exception: {e}")
+        return False
 
 
 def tg_get_updates(offset: int) -> List[Dict]:
@@ -170,7 +179,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             f"Анализ активов: {len(SYMBOLS)}\n"
             f"TF: {TIMEFRAME}\n"
             f"Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
-            f"Мин. вероятность: {MIN_CONFIDENCE}%",
+            f"Мин. уверенность: {MIN_CONFIDENCE}%",
             chat_id=chat_id,
         )
         return
@@ -231,6 +240,10 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
     if command == "/now":
         with state_lock:
             run_now_request["chat_id"] = chat_id
+        tg_send(
+            "Ок. Запускаю внеочередной цикл анализа. Результат пришлю следующим сообщением.",
+            chat_id=chat_id,
+        )
         return
 
 
@@ -442,8 +455,6 @@ def compute_signal(highs: List[float], lows: List[float], closes: List[float]) -
 
     return direction, info
 
-    return None, info
-
 
 def run_signal_cycle(
     exchange: ccxt.bybit,
@@ -453,12 +464,35 @@ def run_signal_cycle(
 ) -> Optional[Dict]:
     last_signal = None
     candidates = []
+
+    def _fetch(symbol: str):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=240)
+            df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            df.set_index("ts", inplace=True)
+            return symbol, df, None
+        except Exception as e:
+            return symbol, None, e
+
+    dfs = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_fetch, s) for s in SYMBOLS]
+        for fut in as_completed(futures):
+            symbol, df, err = fut.result()
+            if err is not None:
+                print(f"[DATA] fetch error {symbol}: {err}")
+                continue
+            dfs[symbol] = df
+
     for symbol in SYMBOLS:
         try:
-            candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
-            highs = [c[2] for c in candles]
-            lows = [c[3] for c in candles]
-            closes = [c[4] for c in candles]
+            df = dfs.get(symbol)
+            if df is None:
+                continue
+            highs = df["high"].tolist()
+            lows = df["low"].tolist()
+            closes = df["close"].tolist()
 
             signal, info = compute_signal(highs, lows, closes)
 
@@ -551,6 +585,15 @@ def run_signal_cycle(
 # ================== MAIN ==================
 def command_loop(state: Dict) -> None:
     update_offset = 0
+    # flush old updates on startup (do not process backlog)
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        r = requests.get(url, params={"timeout": 0}, timeout=10)
+        data = r.json()
+        if data.get("ok") and data.get("result"):
+            update_offset = data["result"][-1]["update_id"] + 1
+    except Exception as e:
+        print(f"[CMD] flush updates error: {e}")
     print("Command loop started")
 
     while True:
@@ -586,7 +629,11 @@ def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
                 run_now_request["chat_id"] = None
 
         if run_now_chat_id is not None:
-            last_signal = run_signal_cycle(exchange, state, send_signals=False, allow_cooldown=False)
+            try:
+                last_signal = run_signal_cycle(exchange, state, send_signals=False, allow_cooldown=False)
+            except Exception as e:
+                print(f"[SIGNAL_LOOP] cycle error: {e}")
+                last_signal = None
             if last_signal:
                 tg_send(format_last_signal(last_signal), chat_id=run_now_chat_id)
             else:
@@ -596,7 +643,10 @@ def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
             paused = state.get("paused", False)
 
         if not paused and time.time() >= next_run:
-            run_signal_cycle(exchange, state, send_signals=True)
+            try:
+                run_signal_cycle(exchange, state, send_signals=True)
+            except Exception as e:
+                print(f"[SIGNAL_LOOP] cycle error: {e}")
             next_run = time.time() + CHECK_EVERY_SECONDS
 
         time.sleep(1)
