@@ -706,6 +706,10 @@ def run_signal_cycle(
         55,
         95,
     ) / 100
+    numeric_probability = display_probability * 100
+    min_confidence = float(MIN_CONFIDENCE)
+    if numeric_probability < min_confidence:
+        return last_signal
     prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
 
     price = info["price"]
@@ -739,7 +743,7 @@ def run_signal_cycle(
         "pair": normalize_symbol(symbol),
         "direction": signal,
         "confidence": info["confidence"],
-        "probability": round(display_probability * 100, 2),
+        "probability": round(numeric_probability, 2),
         "price": info["price"],
     }
     key = f"{symbol}_{signal}"
