@@ -45,7 +45,11 @@ run_now_request = {"chat_id": None}
 
 
 # ================== TELEGRAM ==================
-def tg_send(text: str, chat_id: Optional[int] = None) -> bool:
+def tg_send(
+    text: str,
+    chat_id: Optional[int] = None,
+    reply_markup: Optional[Dict] = None,
+) -> bool:
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -54,6 +58,8 @@ def tg_send(text: str, chat_id: Optional[int] = None) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         r = requests.post(url, json=payload, timeout=15)
         if r.status_code != 200:
             print(f"[TG] sendMessage failed: {r.status_code} {r.text}")
@@ -71,6 +77,19 @@ def tg_get_updates(offset: int) -> List[Dict]:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
     data = r.json()
     return data.get("result", [])
+
+
+def main_keyboard() -> Dict:
+    return {
+        "keyboard": [
+            [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
+            [{"text": "📌 Сигналы"}, {"text": "⏸ Пауза"}, {"text": "▶️ Резюм"}],
+            [{"text": "ℹ️ Помощь"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+        "is_persistent": True,
+    }
 
 
 # ================== STATE ==================
@@ -170,6 +189,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
             f"🛡 Антиспам: {COOLDOWN_MINUTES} мин",
             chat_id=chat_id,
+            reply_markup=main_keyboard(),
         )
         return
 
@@ -585,6 +605,14 @@ def run_signal_cycle(
 # ================== MAIN ==================
 def command_loop(state: Dict) -> None:
     update_offset = 0
+    BUTTON_TO_COMMAND = {
+        "📊 Статус": "/status",
+        "⚡ Сейчас": "/now",
+        "📌 Сигналы": "/signals",
+        "⏸ Пауза": "/pause",
+        "▶️ Резюм": "/resume",
+        "ℹ️ Помощь": "/help",
+    }
     # flush old updates on startup (do not process backlog)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -609,8 +637,13 @@ def command_loop(state: Dict) -> None:
                 text = message.get("text", "")
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
+                cmd = None
                 if text.startswith("/"):
-                    handle_command(text, chat_id, state)
+                    cmd = text
+                else:
+                    cmd = BUTTON_TO_COMMAND.get(text)
+                if cmd:
+                    handle_command(cmd, chat_id, state)
         except Exception as e:
             print(f"[telegram] ERROR: {e}")
 
