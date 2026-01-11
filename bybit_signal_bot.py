@@ -4,11 +4,11 @@ import threading
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
+import math
 
 import ccxt
 import pandas as pd
 import requests
-from probability_engine import get_probability, load_stats, make_key
 
 
 # ================== ТВОИ ДАННЫЕ ==================
@@ -470,14 +470,18 @@ def adx(highs: List[float], lows: List[float], closes: List[float], period: int 
 
 
 # ================== SIGNAL LOGIC ==================
-def compute_signal(highs: List[float], lows: List[float], closes: List[float]) -> Tuple[Optional[str], Dict]:
-    # Нужно достаточно свечей для EMA200
-    if len(closes) < 220:
+def compute_signal(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    volumes: List[float],
+) -> Tuple[Optional[str], Dict]:
+    if len(closes) < 200:
         return None, {}
 
     price = closes[-1]
-    ema50 = ema(closes, 50)[-1]
-    ema200 = ema(closes, 200)[-1]
+    ema_fast = ema(closes, 50)[-1]
+    ema_slow = ema(closes, 200)[-1]
     rsi14 = rsi(closes, 14)[-1]
     adx14 = adx(highs, lows, closes, 14)
     atr14 = atr(highs, lows, closes, 14)
@@ -485,86 +489,139 @@ def compute_signal(highs: List[float], lows: List[float], closes: List[float]) -
     if adx14 is None or atr14 is None:
         return None, {}
 
-    if adx14 < 20:
-        return None, {"adx": adx14}
-
-    # Тренд
-    trend_up = 1 if ema50 > ema200 else 0
-    trend_down = 1 - trend_up
-
-    # Цена относительно EMA50
-    price_up = 1 if price > ema50 else 0
-    price_down = 1 - price_up
-
-    # RSI как “импульс”
-    rsi_up = min(max((rsi14 - 50) / 20, 0), 1)
-    rsi_down = min(max((50 - rsi14) / 20, 0), 1)
-
-    # “сила” движения (в пределах 1%)
-    strength = min(abs(price - ema50) / ema50 / 0.01, 1)
-
-    # Итоговые “очки”
-    score_up = (0.40 * trend_up) + (0.25 * price_up) + (0.25 * rsi_up) + (0.10 * strength * price_up)
-    score_down = (0.40 * trend_down) + (0.25 * price_down) + (0.25 * rsi_down) + (0.10 * strength * price_down)
-
-    total = score_up + score_down
-    if total == 0:
+    if len(volumes) < 20:
         return None, {}
 
-    up_pct = (score_up / total) * 100
-    down_pct = 100 - up_pct
+    volume_sma20 = sum(volumes[-20:]) / 20
+    if volume_sma20 <= 0:
+        return None, {}
+    volume_ratio = volumes[-1] / volume_sma20
 
-    direction = "UP" if up_pct > down_pct else "DOWN"
-    confidence = max(up_pct, down_pct)
+    n = 20
+    if len(highs) < n + 1 or len(lows) < n + 1:
+        return None, {}
+    high_n = max(highs[-n:])
+    low_n = min(lows[-n:])
+    high_n_prev = max(highs[-n - 1:-1])
+    low_n_prev = min(lows[-n - 1:-1])
+    breakout_up = price > high_n_prev
+    breakout_down = price < low_n_prev
 
-    info = {
-        "price": price,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi14,
-        "adx": adx14,
-        "atr": atr14,
-        "up_pct": round(up_pct),
-        "down_pct": round(down_pct),
-        "confidence": round(confidence),
-    }
+    indicator_values = [price, ema_fast, ema_slow, rsi14, adx14, atr14, volume_sma20, volume_ratio]
+    if any(math.isnan(v) for v in indicator_values):
+        return None, {}
 
-    if confidence < MIN_CONFIDENCE:
-        return None, info
+    trend_long = price > ema_slow and ema_fast > ema_slow
+    trend_short = price < ema_slow and ema_fast < ema_slow
 
-    if direction == "UP":
-        confirmed = closes[-1] > highs[-2] or closes[-1] > closes[-2] + 0.3 * atr14
-    else:
-        confirmed = closes[-1] < lows[-2] or closes[-1] < closes[-2] - 0.3 * atr14
+    def _overheat_penalty(direction: str) -> float:
+        if direction == "UP":
+            return clamp((rsi14 - 72) / 8, 0, 1)
+        return clamp((28 - rsi14) / 8, 0, 1)
 
-    if not confirmed:
-        return None, info
+    def _build_signal(direction: str) -> Tuple[Optional[str], Dict]:
+        if direction == "UP":
+            trend_ok = trend_long
+            strength_filters = [
+                adx14 >= 22,
+                volume_ratio >= 1.20,
+                breakout_up,
+                rsi14 <= 72,
+            ]
+        else:
+            trend_ok = trend_short
+            strength_filters = [
+                adx14 >= 22,
+                volume_ratio >= 1.20,
+                breakout_down,
+                rsi14 >= 28,
+            ]
 
-    if direction == "UP":
-        sl = price - 1.5 * atr14
-        tp = price + 2.5 * atr14
-    else:
-        sl = price + 1.5 * atr14
-        tp = price - 2.5 * atr14
+        passed = sum(1 for ok in strength_filters if ok)
+        if not trend_ok or passed < 3:
+            return None, {}
 
-    rr = abs(tp - price) / max(abs(price - sl), 1e-9)
-    if rr < 1.6:
-        return None, info
+        entry = price
+        if direction == "UP":
+            sl_struct = low_n
+            sl = min(sl_struct, entry - 1.2 * atr14)
+        else:
+            sl_struct = high_n
+            sl = max(sl_struct, entry + 1.2 * atr14)
 
-    quality_score = (
-        (confidence / 100) * 0.45
-        + min(adx14 / 40, 1) * 0.35
-        + min(rr / 3, 1) * 0.20
-    )
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return None, {}
 
-    info.update({
-        "sl": sl,
-        "tp": tp,
-        "rr": rr,
-        "quality_score": quality_score,
-    })
+        if direction == "UP":
+            tp = entry + 3 * risk
+        else:
+            tp = entry - 3 * risk
 
-    return direction, info
+        if direction == "UP":
+            if not (sl < entry < tp):
+                return None, {}
+        else:
+            if not (tp < entry < sl):
+                return None, {}
+
+        rr = abs(tp - entry) / risk
+        if rr < 3.0:
+            return None, {}
+
+        overheat_penalty = _overheat_penalty(direction)
+        breakout_flag = breakout_up if direction == "UP" else breakout_down
+
+        score = (
+            1.5 * min(adx14 / 40, 1)
+            + 1.0 * min(volume_ratio / 2, 1)
+            + 1.2 * min(rr / 5, 1)
+            + 0.8 * (1 if breakout_flag else 0)
+            - 0.6 * overheat_penalty
+        )
+
+        confidence = clamp(
+            55
+            + 6 * passed
+            + 12 * min(adx14 / 40, 1)
+            + 8 * min(volume_ratio / 2, 1)
+            + 10 * min(rr / 5, 1),
+            0,
+            99,
+        )
+        if confidence < MIN_CONFIDENCE:
+            return None, {}
+
+        info = {
+            "price": entry,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "rsi": rsi14,
+            "adx": adx14,
+            "atr": atr14,
+            "volume_ratio": volume_ratio,
+            "breakout": breakout_flag,
+            "overheat_penalty": overheat_penalty,
+            "confidence": round(confidence),
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+            "quality_score": score,
+        }
+        return direction, info
+
+    signal_long, info_long = _build_signal("UP")
+    signal_short, info_short = _build_signal("DOWN")
+
+    if signal_long and signal_short:
+        if info_long.get("quality_score", 0) >= info_short.get("quality_score", 0):
+            return signal_long, info_long
+        return signal_short, info_short
+    if signal_long:
+        return signal_long, info_long
+    if signal_short:
+        return signal_short, info_short
+    return None, {}
 
 
 def run_signal_cycle(
@@ -578,7 +635,7 @@ def run_signal_cycle(
 
     def _fetch(symbol: str):
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=240)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
             df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             df.set_index("ts", inplace=True)
@@ -601,11 +658,14 @@ def run_signal_cycle(
             df = dfs.get(symbol)
             if df is None:
                 continue
+            if len(df) < 200:
+                continue
             highs = df["high"].tolist()
             lows = df["low"].tolist()
             closes = df["close"].tolist()
+            volumes = df["volume"].tolist()
 
-            signal, info = compute_signal(highs, lows, closes)
+            signal, info = compute_signal(highs, lows, closes, volumes)
 
             if not signal:
                 continue
@@ -635,19 +695,17 @@ def run_signal_cycle(
     signal = best["signal"]
     info = best["info"]
 
-    stats = load_stats()
-    min_samples = stats.get("meta", {}).get("min_samples", 50)
     side = "LONG" if signal == "UP" else "SHORT"
-    probability_key = make_key(symbol, TIMEFRAME, side)
-    bucket = stats.get("buckets", {}).get(probability_key, {})
-    total_samples = bucket.get("total", 0)
-    allow_high_confidence = total_samples >= min_samples
-    probability = get_probability(probability_key, min_samples=min_samples)
-    display_probability = compute_display_probability(
-        probability,
-        info,
-        allow_high_confidence=allow_high_confidence,
-    )
+    overheat_penalty = info.get("overheat_penalty", 0)
+    display_probability = clamp(
+        55
+        + 0.35 * (info.get("adx", 0) - 18)
+        + 8 * (info.get("volume_ratio", 1) - 1)
+        + 6 * (info.get("rr", 3) - 3)
+        - 10 * overheat_penalty,
+        55,
+        95,
+    ) / 100
     prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
 
     price = info["price"]
