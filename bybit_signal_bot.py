@@ -114,9 +114,21 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
-def compute_display_probability(probability: Optional[float], info: Dict) -> float:
+def format_price(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    decimals = 2 if abs(value) >= 1 else 6
+    return f"{value:.{decimals}f}"
+
+
+def compute_display_probability(
+    probability: Optional[float],
+    info: Dict,
+    allow_high_confidence: bool = False,
+) -> float:
     if probability is not None:
-        return clamp(probability, 0.01, 1.0)
+        max_value = 0.99 if allow_high_confidence else 0.95
+        return clamp(probability, 0.01, max_value)
 
     quality_score = info.get("quality_score")
     if quality_score is None:
@@ -136,9 +148,11 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
 
     if command == "/start":
         tg_send(
-            "🤖 Crypto Signal Bot запущен\n"
-            f"Пары: {format_pairs(' / ')}\n"
-            f"TF: {TIMEFRAME}",
+            "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
+            f"🧠 Анализ активов: {len(SYMBOLS)}\n"
+            f"⏱ Таймфрейм: {TIMEFRAME}\n"
+            f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
+            f"🛡 Антиспам: {COOLDOWN_MINUTES} мин",
             chat_id=chat_id,
         )
         return
@@ -146,7 +160,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
     if command == "/status":
         tg_send(
             "📊 Статус бота:\n"
-            f"Пары: {format_pairs(', ')}\n"
+            f"Анализ активов: {len(SYMBOLS)}\n"
             f"TF: {TIMEFRAME}\n"
             f"Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
             f"Мин. вероятность: {MIN_CONFIDENCE}%",
@@ -473,22 +487,35 @@ def run_signal_cycle(
     min_samples = stats.get("meta", {}).get("min_samples", 50)
     side = "LONG" if signal == "UP" else "SHORT"
     probability_key = make_key(symbol, TIMEFRAME, side)
+    bucket = stats.get("buckets", {}).get(probability_key, {})
+    total_samples = bucket.get("total", 0)
+    allow_high_confidence = total_samples >= min_samples
     probability = get_probability(probability_key, min_samples=min_samples)
-    display_probability = compute_display_probability(probability, info)
+    display_probability = compute_display_probability(
+        probability,
+        info,
+        allow_high_confidence=allow_high_confidence,
+    )
     prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
 
     price = info["price"]
+    sl = info.get("sl")
+    tp = info.get("tp")
+    pair_text = f"{normalize_symbol(symbol)} / USDT"
     timeframe = TIMEFRAME
+
+    sl_line = f"🛑 SL: {format_price(sl)}\n" if sl is not None else ""
+    tp_line = f"🎯 TP: {format_price(tp)}\n\n" if tp is not None else "\n"
 
     msg = (
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📈 ТОРГОВЫЙ СИГНАЛ\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🪙 Пара: {symbol} / USDT\n"
+        f"🪙 Пара: {pair_text}\n"
         f"📍 Направление: {'ВВЕРХ ⬆️' if side == 'LONG' else 'ВНИЗ ⬇️'}\n"
-        f"💰 Цена входа: {price}\n"
-        f"🛑 SL: {info['sl']}\n"
-        f"🎯 TP: {info['tp']}\n\n"
+        f"💰 Цена входа: {format_price(price)}\n"
+        f"{sl_line}"
+        f"{tp_line}"
         "🎯 Вероятность успеха\n"
         f"{prob_line}\n\n"
         f"⏱ Таймфрейм: {timeframe}\n"
@@ -569,6 +596,12 @@ def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
 
 def main() -> None:
     global MIN_CONFIDENCE
+    if not TELEGRAM_BOT_TOKEN:
+        print(
+            "ERROR: TELEGRAM_BOT_TOKEN is not set. "
+            "Please set environment variable TELEGRAM_BOT_TOKEN."
+        )
+        raise SystemExit(1)
     exchange = ccxt.bybit({
         "apiKey": BYBIT_API_KEY,
         "secret": BYBIT_API_SECRET,
