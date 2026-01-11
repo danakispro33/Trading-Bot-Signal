@@ -83,7 +83,8 @@ def main_keyboard() -> Dict:
     return {
         "keyboard": [
             [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
-            [{"text": "📌 Сигналы"}, {"text": "⏸ Пауза"}, {"text": "▶️ Резюм"}],
+            [{"text": "📌 Сигналы"}, {"text": "🎯 Confidence"}],
+            [{"text": "⚙️ SetConfidence"}, {"text": "⏸ Пауза"}, {"text": "▶️ Резюм"}],
             [{"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
@@ -240,6 +241,15 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
                     save_state(state)
                 tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
                 return
+        if len(parts) == 1:
+            with state_lock:
+                state["awaiting_confidence"] = True
+                save_state(state)
+            tg_send(
+                "Введите минимальную уверенность (целое число 1–99), например 65.",
+                chat_id=chat_id,
+            )
+            return
         tg_send("❌ Используй: /setconfidence 65", chat_id=chat_id)
         return
 
@@ -604,11 +614,14 @@ def run_signal_cycle(
 
 # ================== MAIN ==================
 def command_loop(state: Dict) -> None:
+    global MIN_CONFIDENCE
     update_offset = 0
     BUTTON_TO_COMMAND = {
         "📊 Статус": "/status",
         "⚡ Сейчас": "/now",
         "📌 Сигналы": "/signals",
+        "🎯 Confidence": "/confidence",
+        "⚙️ SetConfidence": "/setconfidence",
         "⏸ Пауза": "/pause",
         "▶️ Резюм": "/resume",
         "ℹ️ Помощь": "/help",
@@ -636,6 +649,24 @@ def command_loop(state: Dict) -> None:
                 chat_id = chat.get("id")
                 text = message.get("text", "")
                 if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+                with state_lock:
+                    awaiting = state.get("awaiting_confidence", False)
+                if awaiting:
+                    t = (text or "").strip()
+                    if t.isdigit():
+                        value = int(t)
+                        if 1 <= value <= 99:
+                            MIN_CONFIDENCE = value
+                            with state_lock:
+                                state["min_confidence"] = value
+                                state["awaiting_confidence"] = False
+                                save_state(state)
+                            tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
+                        else:
+                            tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
+                    else:
+                        tg_send("❌ Введите число (например 65).", chat_id=chat_id)
                     continue
                 cmd = None
                 if text.startswith("/"):
@@ -703,6 +734,7 @@ def main() -> None:
     with state_lock:
         state = load_state()
         state.setdefault("min_confidence", MIN_CONFIDENCE)
+        state.setdefault("awaiting_confidence", False)
         state.setdefault("paused", False)
         state.setdefault("last_signal", None)
         save_state(state)
