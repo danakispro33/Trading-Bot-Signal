@@ -79,6 +79,14 @@ def tg_get_updates(offset: int) -> List[Dict]:
     return data.get("result", [])
 
 
+def tg_answer_callback(callback_id: str) -> None:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        requests.post(url, json={"callback_query_id": callback_id}, timeout=10)
+    except Exception as e:
+        print(f"[TG] answerCallbackQuery exception: {e}")
+
+
 def main_keyboard() -> Dict:
     return {
         "keyboard": [
@@ -143,13 +151,13 @@ def format_now_signal(last_signal: Dict) -> str:
     direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
     probability = last_signal.get("probability")
     return (
-        "⚡ ВНЕОЧЕРЕДНОЙ АНАЛИЗ\n"
+        "⚡ <b>ВНЕОЧЕРЕДНОЙ АНАЛИЗ</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"💱 Пара               : {last_signal.get('pair', '')}\n"
-        f"🔀 Направление        : {direction}\n"
-        f"🎯 Вероятность        : {probability}%\n"
-        f"💰 Цена               : {last_signal.get('price', '')}\n"
-        f"⏱ Таймфрейм          : {TIMEFRAME}\n"
+        f"🧩 Пара:{last_signal.get('pair', '')}\n"
+        f"📈 Направление:{direction}\n"
+        f"🎯 Вероятность:{probability:.2f}%\n"
+        f"💰 Цена:{last_signal.get('price', '')}\n"
+        f"🕒 Таймфрейм:{TIMEFRAME}\n"
         "━━━━━━━━━━━━━━━━"
     )
 
@@ -253,6 +261,25 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             "⚡ Сейчас\n"
             "━━━━━━━━━━━━",
             chat_id=chat_id,
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "📊 Статус", "callback_data": "cmd:status"},
+                        {"text": "⚡ Сейчас", "callback_data": "cmd:now"},
+                    ],
+                    [
+                        {"text": "🎯 Сигналы", "callback_data": "cmd:signals"},
+                        {"text": "🧪 Confidence", "callback_data": "cmd:confidence"},
+                    ],
+                    [
+                        {"text": "⚙️ SetConfidence", "callback_data": "cmd:setconfidence"},
+                    ],
+                    [
+                        {"text": "⏸ Пауза", "callback_data": "cmd:pause"},
+                        {"text": "▶️ Резюм", "callback_data": "cmd:resume"},
+                    ],
+                ]
+            },
         )
         return
 
@@ -680,6 +707,15 @@ def command_loop(state: Dict) -> None:
         "▶️ Резюм": "/resume",
         "ℹ️ Помощь": "/help",
     }
+    CALLBACK_TO_COMMAND = {
+        "cmd:status": "/status",
+        "cmd:signals": "/signals",
+        "cmd:confidence": "/confidence",
+        "cmd:setconfidence": "/setconfidence",
+        "cmd:pause": "/pause",
+        "cmd:resume": "/resume",
+        "cmd:now": "/now",
+    }
     # flush old updates on startup (do not process backlog)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
@@ -696,6 +732,21 @@ def command_loop(state: Dict) -> None:
             updates = tg_get_updates(update_offset)
             for update in updates:
                 update_offset = max(update_offset, update.get("update_id", 0) + 1)
+                callback_query = update.get("callback_query")
+                if callback_query:
+                    callback_id = callback_query.get("id")
+                    if callback_id:
+                        tg_answer_callback(callback_id)
+                    data = callback_query.get("data", "")
+                    message = callback_query.get("message", {})
+                    chat = message.get("chat", {})
+                    chat_id = chat.get("id")
+                    if chat_id != TELEGRAM_CHAT_ID:
+                        continue
+                    cmd = CALLBACK_TO_COMMAND.get(data)
+                    if cmd:
+                        handle_command(cmd, chat_id, state)
+                    continue
                 message = update.get("message")
                 if not message:
                     continue
