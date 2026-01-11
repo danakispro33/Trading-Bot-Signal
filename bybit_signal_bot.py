@@ -1,6 +1,7 @@
 import time
 import json
 import threading
+import os
 from typing import List, Dict, Optional, Tuple
 
 import ccxt
@@ -9,7 +10,7 @@ from probability_engine import get_probability, load_stats, make_key
 
 
 # ================== ТВОИ ДАННЫЕ ==================
-TELEGRAM_BOT_TOKEN = "8320181117:AAEPakY2UCJQyFzkw4xvFkpLYgsm-Fo7Pwg"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = 5878255923
 
 # Bybit API (для просто сигналов можно оставить пустым)
@@ -109,16 +110,20 @@ def probability_bar(p: float, length: int = 10) -> str:
         return "▱" * length
 
 
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
 def compute_display_probability(probability: Optional[float], info: Dict) -> float:
     if probability is not None:
-        return min(max(probability, 0.01), 1.0)
+        return clamp(probability, 0.01, 1.0)
 
-    confidence = info.get("confidence")
-    if confidence is None:
+    quality_score = info.get("quality_score")
+    if quality_score is None:
         return 0.01
 
-    fallback = max(float(confidence), 1.0) / 100
-    return min(max(fallback, 0.01), 1.0)
+    fallback = 0.5 + 0.5 * float(quality_score)
+    return clamp(fallback, 0.01, 0.95)
 
 
 def handle_command(text: str, chat_id: int, state: Dict) -> None:
@@ -245,8 +250,82 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
     return rsi_vals
 
 
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return None
+
+    atr_value = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr_value = (atr_value * (period - 1) + tr) / period
+    return atr_value
+
+
+def adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < (period * 2) + 1:
+        return None
+
+    trs = []
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(closes)):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+        trs.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+        )
+
+    if len(trs) < period:
+        return None
+
+    tr_smooth = sum(trs[:period])
+    plus_smooth = sum(plus_dm[:period])
+    minus_smooth = sum(minus_dm[:period])
+
+    dx_values = []
+    for i in range(period, len(trs)):
+        tr_smooth = tr_smooth - (tr_smooth / period) + trs[i]
+        plus_smooth = plus_smooth - (plus_smooth / period) + plus_dm[i]
+        minus_smooth = minus_smooth - (minus_smooth / period) + minus_dm[i]
+
+        if tr_smooth == 0:
+            dx_values.append(0.0)
+            continue
+
+        plus_di = 100 * (plus_smooth / tr_smooth)
+        minus_di = 100 * (minus_smooth / tr_smooth)
+        di_sum = plus_di + minus_di
+        dx = 0.0 if di_sum == 0 else 100 * abs(plus_di - minus_di) / di_sum
+        dx_values.append(dx)
+
+    if len(dx_values) < period:
+        return None
+
+    adx_value = sum(dx_values[:period]) / period
+    for dx in dx_values[period:]:
+        adx_value = (adx_value * (period - 1) + dx) / period
+    return adx_value
+
+
 # ================== SIGNAL LOGIC ==================
-def compute_signal(closes: List[float]) -> Tuple[Optional[str], Dict]:
+def compute_signal(highs: List[float], lows: List[float], closes: List[float]) -> Tuple[Optional[str], Dict]:
     # Нужно достаточно свечей для EMA200
     if len(closes) < 220:
         return None, {}
@@ -255,6 +334,14 @@ def compute_signal(closes: List[float]) -> Tuple[Optional[str], Dict]:
     ema50 = ema(closes, 50)[-1]
     ema200 = ema(closes, 200)[-1]
     rsi14 = rsi(closes, 14)[-1]
+    adx14 = adx(highs, lows, closes, 14)
+    atr14 = atr(highs, lows, closes, 14)
+
+    if adx14 is None or atr14 is None:
+        return None, {}
+
+    if adx14 < 20:
+        return None, {"adx": adx14}
 
     # Тренд
     trend_up = 1 if ema50 > ema200 else 0
@@ -290,13 +377,49 @@ def compute_signal(closes: List[float]) -> Tuple[Optional[str], Dict]:
         "ema50": ema50,
         "ema200": ema200,
         "rsi": rsi14,
+        "adx": adx14,
+        "atr": atr14,
         "up_pct": round(up_pct),
         "down_pct": round(down_pct),
         "confidence": round(confidence),
     }
 
-    if confidence >= MIN_CONFIDENCE:
-        return direction, info
+    if confidence < MIN_CONFIDENCE:
+        return None, info
+
+    if direction == "UP":
+        confirmed = closes[-1] > highs[-2] or closes[-1] > closes[-2] + 0.3 * atr14
+    else:
+        confirmed = closes[-1] < lows[-2] or closes[-1] < closes[-2] - 0.3 * atr14
+
+    if not confirmed:
+        return None, info
+
+    if direction == "UP":
+        sl = price - 1.5 * atr14
+        tp = price + 2.5 * atr14
+    else:
+        sl = price + 1.5 * atr14
+        tp = price - 2.5 * atr14
+
+    rr = abs(tp - price) / max(abs(price - sl), 1e-9)
+    if rr < 1.6:
+        return None, info
+
+    quality_score = (
+        (confidence / 100) * 0.45
+        + min(adx14 / 40, 1) * 0.35
+        + min(rr / 3, 1) * 0.20
+    )
+
+    info.update({
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "quality_score": quality_score,
+    })
+
+    return direction, info
 
     return None, info
 
@@ -308,12 +431,15 @@ def run_signal_cycle(
     allow_cooldown: bool = True,
 ) -> Optional[Dict]:
     last_signal = None
+    candidates = []
     for symbol in SYMBOLS:
         try:
             candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
+            highs = [c[2] for c in candles]
+            lows = [c[3] for c in candles]
             closes = [c[4] for c in candles]
 
-            signal, info = compute_signal(closes)
+            signal, info = compute_signal(highs, lows, closes)
 
             if not signal:
                 continue
@@ -325,47 +451,64 @@ def run_signal_cycle(
             if allow_cooldown and time.time() - last_time < COOLDOWN_MINUTES * 60:
                 continue
 
-            stats = load_stats()
-            min_samples = stats.get("meta", {}).get("min_samples", 50)
-            side = "LONG" if signal == "UP" else "SHORT"
-            probability_key = make_key(symbol, TIMEFRAME, side)
-            probability = get_probability(probability_key, min_samples=min_samples)
-            display_probability = compute_display_probability(probability, info)
-            prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
-
-            price = info["price"]
-            timeframe = TIMEFRAME
-
-            msg = (
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "📈 ТОРГОВЫЙ СИГНАЛ\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🪙 Пара: {symbol} / USDT\n"
-                f"📍 Направление: {'ВВЕРХ ⬆️' if side == 'LONG' else 'ВНИЗ ⬇️'}\n"
-                f"💰 Цена входа: {price}\n\n"
-                "🎯 Вероятность успеха\n"
-                f"{prob_line}\n\n"
-                f"⏱ Таймфрейм: {timeframe}\n"
-                "━━━━━━━━━━━━━━━━━━━━"
-            )
-
-            if send_signals:
-                tg_send(msg)
-
-            last_signal = {
-                "pair": normalize_symbol(symbol),
-                "direction": signal,
-                "confidence": info["confidence"],
-                "price": info["price"],
-            }
-            with state_lock:
-                state["last_signal"] = last_signal
-                state[key] = time.time()
-                save_state(state)
+            candidates.append({
+                "symbol": symbol,
+                "signal": signal,
+                "info": info,
+            })
 
         except Exception as e:
             # Покажем ошибку в консоли, чтобы ты видел, что не так
             print(f"[{symbol}] ERROR: {e}")
+
+    if not candidates:
+        return last_signal
+
+    best = max(candidates, key=lambda item: item["info"].get("quality_score", 0))
+    symbol = best["symbol"]
+    signal = best["signal"]
+    info = best["info"]
+
+    stats = load_stats()
+    min_samples = stats.get("meta", {}).get("min_samples", 50)
+    side = "LONG" if signal == "UP" else "SHORT"
+    probability_key = make_key(symbol, TIMEFRAME, side)
+    probability = get_probability(probability_key, min_samples=min_samples)
+    display_probability = compute_display_probability(probability, info)
+    prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
+
+    price = info["price"]
+    timeframe = TIMEFRAME
+
+    msg = (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📈 ТОРГОВЫЙ СИГНАЛ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🪙 Пара: {symbol} / USDT\n"
+        f"📍 Направление: {'ВВЕРХ ⬆️' if side == 'LONG' else 'ВНИЗ ⬇️'}\n"
+        f"💰 Цена входа: {price}\n"
+        f"🛑 SL: {info['sl']}\n"
+        f"🎯 TP: {info['tp']}\n\n"
+        "🎯 Вероятность успеха\n"
+        f"{prob_line}\n\n"
+        f"⏱ Таймфрейм: {timeframe}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    if send_signals:
+        tg_send(msg)
+
+    last_signal = {
+        "pair": normalize_symbol(symbol),
+        "direction": signal,
+        "confidence": info["confidence"],
+        "price": info["price"],
+    }
+    key = f"{symbol}_{signal}"
+    with state_lock:
+        state["last_signal"] = last_signal
+        state[key] = time.time()
+        save_state(state)
 
     return last_signal
 
@@ -398,7 +541,7 @@ def command_loop(state: Dict) -> None:
 
 def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
     print("Signal loop started")
-    next_run = time.time()
+    next_run = time.time() + CHECK_EVERY_SECONDS
 
     while True:
         run_now_chat_id = None
