@@ -92,11 +92,18 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
 
     direction_map = {"UP": "ВВЕРХ", "DOWN": "ВНИЗ"}
     direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
+    probability = last_signal.get("probability")
+    confidence = last_signal.get("confidence")
+    probability_line = (
+        f"Вероятность успеха: {probability}%"
+        if probability is not None
+        else f"Уверенность: {confidence}%"
+    )
     return (
         "📈 Последний сигнал:\n"
         f"Пара: {last_signal.get('pair', '')}\n"
         f"Направление: {direction}\n"
-        f"Вероятность: {last_signal.get('confidence', '')}%\n"
+        f"{probability_line}\n"
         f"Цена: {last_signal.get('price', '')}"
     )
 
@@ -529,6 +536,7 @@ def run_signal_cycle(
         "pair": normalize_symbol(symbol),
         "direction": signal,
         "confidence": info["confidence"],
+        "probability": round(display_probability * 100, 2),
         "price": info["price"],
     }
     key = f"{symbol}_{signal}"
