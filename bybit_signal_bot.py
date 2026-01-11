@@ -912,12 +912,17 @@ def main() -> None:
 
     with state_lock:
         state = load_state()
-        state.setdefault("min_confidence", MIN_CONFIDENCE)
+        default_confidence = MIN_CONFIDENCE
+        state.setdefault("min_confidence", default_confidence)
         state.setdefault("awaiting_confidence", False)
         state.setdefault("paused", False)
         state.setdefault("last_signal", None)
+        try:
+            MIN_CONFIDENCE = int(state.get("min_confidence", default_confidence))
+        except (TypeError, ValueError):
+            MIN_CONFIDENCE = default_confidence
+            state["min_confidence"] = default_confidence
         save_state(state)
-        MIN_CONFIDENCE = state.get("min_confidence", MIN_CONFIDENCE)
 
     # Сообщение при старте (должно прийти всегда)
     tg_send(
