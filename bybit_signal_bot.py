@@ -117,23 +117,40 @@ def format_pairs(separator: str) -> str:
 
 def format_last_signal(last_signal: Optional[Dict]) -> str:
     if not last_signal:
-        return "📈 Последний сигнал:\nПока нет сигналов"
+        return (
+            "📌 ПОСЛЕДНИЙ СИГНАЛ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "⏳ Сейчас сигнала нет\n"
+            "━━━━━━━━━━━━━━━━"
+        )
 
     direction_map = {"UP": "ВВЕРХ", "DOWN": "ВНИЗ"}
     direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
     probability = last_signal.get("probability")
-    confidence = last_signal.get("confidence")
-    probability_line = (
-        f"Вероятность успеха: {probability}%"
-        if probability is not None
-        else f"Уверенность: {confidence}%"
-    )
     return (
-        "📈 Последний сигнал:\n"
-        f"Пара: {last_signal.get('pair', '')}\n"
-        f"Направление: {direction}\n"
-        f"{probability_line}\n"
-        f"Цена: {last_signal.get('price', '')}"
+        "📌 ПОСЛЕДНИЙ СИГНАЛ\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"💱 Пара               : {last_signal.get('pair', '')}\n"
+        f"🔀 Направление        : {direction}\n"
+        f"🎯 Вероятность        : {probability}%\n"
+        f"💰 Цена               : {last_signal.get('price', '')}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_now_signal(last_signal: Dict) -> str:
+    direction_map = {"UP": "ВВЕРХ", "DOWN": "ВНИЗ"}
+    direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
+    probability = last_signal.get("probability")
+    return (
+        "⚡ ВНЕОЧЕРЕДНОЙ АНАЛИЗ\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"💱 Пара               : {last_signal.get('pair', '')}\n"
+        f"🔀 Направление        : {direction}\n"
+        f"🎯 Вероятность        : {probability}%\n"
+        f"💰 Цена               : {last_signal.get('price', '')}\n"
+        f"⏱ Таймфрейм          : {TIMEFRAME}\n"
+        "━━━━━━━━━━━━━━━━"
     )
 
 
@@ -196,11 +213,13 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
 
     if command == "/status":
         tg_send(
-            "📊 Статус бота:\n"
-            f"Анализ активов: {len(SYMBOLS)}\n"
-            f"TF: {TIMEFRAME}\n"
-            f"Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
-            f"Мин. уверенность: {MIN_CONFIDENCE}%",
+            "🧠 СТАТУС СИСТЕМЫ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"🪙 Анализ активов      : {len(SYMBOLS)}\n"
+            f"⏱ Таймфрейм           : {TIMEFRAME}\n"
+            f"🔄 Проверка            : каждые {CHECK_EVERY_SECONDS} сек\n"
+            f"🎯 Мин. уверенность    : {MIN_CONFIDENCE}%\n"
+            "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
         return
@@ -212,21 +231,27 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         return
 
     if command == "/confidence":
-        tg_send(f"🎯 Минимальная вероятность сигнала: {MIN_CONFIDENCE}%", chat_id=chat_id)
+        tg_send(
+            "🎯 НАСТРОЙКА УВЕРЕННОСТИ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"🎯 Минимальная уверенность : {MIN_CONFIDENCE}%\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
         return
 
     if command == "/help":
         tg_send(
-            "📖 Доступные команды:\n"
-            "/start\n"
-            "/status\n"
-            "/signals\n"
-            "/confidence\n"
-            "/help\n"
-            "/setconfidence 65\n"
-            "/pause\n"
-            "/resume\n"
-            "/now",
+            "ℹ️ ПОМОЩЬ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "📊 Статус        — состояние системы\n"
+            "📌 Сигналы       — последний сигнал\n"
+            "🎯 Confidence    — текущая уверенность\n"
+            "⚙️ SetConfidence — изменить уверенность\n"
+            "⏸ Пауза         — остановить сигналы\n"
+            "▶️ Резюм         — включить сигналы\n"
+            "⚡ Сейчас        — внеочередной анализ\n"
+            "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
         return
@@ -239,39 +264,68 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
                     MIN_CONFIDENCE = value
                     state["min_confidence"] = value
                     save_state(state)
-                tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
+                tg_send(
+                    "✅ НАСТРОЙКА ОБНОВЛЕНА\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    f"🎯 Мин. уверенность : {MIN_CONFIDENCE}%\n"
+                    "━━━━━━━━━━━━━━━━",
+                    chat_id=chat_id,
+                )
                 return
         if len(parts) == 1:
             with state_lock:
                 state["awaiting_confidence"] = True
                 save_state(state)
             tg_send(
-                "Введите минимальную уверенность (целое число 1–99), например 65.",
+                "⚙️ УСТАНОВКА УВЕРЕННОСТИ\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "Введите значение от 1 до 99\n"
+                "Например: 65\n"
+                "━━━━━━━━━━━━━━━━",
                 chat_id=chat_id,
             )
             return
-        tg_send("❌ Используй: /setconfidence 65", chat_id=chat_id)
+        tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
         return
 
     if command == "/pause":
         with state_lock:
             state["paused"] = True
             save_state(state)
-        tg_send("⏸️ Сигналы на паузе", chat_id=chat_id)
+        tg_send(
+            "⏸ СИГНАЛЫ НА ПАУЗЕ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "⏸ Автоматическая отправка\n"
+            "временно остановлена\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
         return
 
     if command == "/resume":
         with state_lock:
             state["paused"] = False
             save_state(state)
-        tg_send("▶️ Сигналы включены", chat_id=chat_id)
+        tg_send(
+            "▶️ СИГНАЛЫ ВКЛЮЧЕНЫ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "▶️ Автоматическая отправка\n"
+            "сигналов активна\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
         return
 
     if command == "/now":
         with state_lock:
             run_now_request["chat_id"] = chat_id
         tg_send(
-            "Ок. Запускаю внеочередной цикл анализа. Результат пришлю следующим сообщением.",
+            "⚡ ВНЕОЧЕРЕДНОЙ АНАЛИЗ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "🔍 Анализ выполняется…\n"
+            "Результат придёт следующим\n"
+            "сообщением\n"
+            "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
         return
@@ -662,11 +716,17 @@ def command_loop(state: Dict) -> None:
                                 state["min_confidence"] = value
                                 state["awaiting_confidence"] = False
                                 save_state(state)
-                            tg_send(f"✅ Установлено: {value}%", chat_id=chat_id)
+                            tg_send(
+                                "✅ НАСТРОЙКА ОБНОВЛЕНА\n"
+                                "━━━━━━━━━━━━━━━━\n"
+                                f"🎯 Мин. уверенность : {MIN_CONFIDENCE}%\n"
+                                "━━━━━━━━━━━━━━━━",
+                                chat_id=chat_id,
+                            )
                         else:
                             tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
                     else:
-                        tg_send("❌ Введите число (например 65).", chat_id=chat_id)
+                        tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
                     continue
                 cmd = None
                 if text.startswith("/"):
@@ -699,9 +759,15 @@ def signal_loop(exchange: ccxt.bybit, state: Dict) -> None:
                 print(f"[SIGNAL_LOOP] cycle error: {e}")
                 last_signal = None
             if last_signal:
-                tg_send(format_last_signal(last_signal), chat_id=run_now_chat_id)
+                tg_send(format_now_signal(last_signal), chat_id=run_now_chat_id)
             else:
-                tg_send("🔎 Сейчас сигнала нет", chat_id=run_now_chat_id)
+                tg_send(
+                    "⚡ ВНЕОЧЕРЕДНОЙ АНАЛИЗ\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    "🔎 Сейчас сигнала нет\n"
+                    "━━━━━━━━━━━━━━━━",
+                    chat_id=run_now_chat_id,
+                )
 
         with state_lock:
             paused = state.get("paused", False)
