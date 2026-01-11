@@ -118,7 +118,7 @@ def format_pairs(separator: str) -> str:
 def format_last_signal(last_signal: Optional[Dict]) -> str:
     if not last_signal:
         return (
-            "📌 ПОСЛЕДНИЙ СИГНАЛ\n"
+            "📌 Последний сигнал\n"
             "━━━━━━━━━━━━━━━━\n"
             "⏳ Сейчас сигнала нет\n"
             "━━━━━━━━━━━━━━━━"
@@ -128,12 +128,12 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
     direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
     probability = last_signal.get("probability")
     return (
-        "📌 ПОСЛЕДНИЙ СИГНАЛ\n"
+        "📌 Последний сигнал\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"💱 Пара               : {last_signal.get('pair', '')}\n"
-        f"🔀 Направление        : {direction}\n"
-        f"🎯 Вероятность        : {probability}%\n"
-        f"💰 Цена               : {last_signal.get('price', '')}\n"
+        f"💱 Пара: {last_signal.get('pair', '')}\n"
+        f"🔀 Направление: {direction}\n"
+        f"🎯 Вероятность: {probability}%\n"
+        f"💰 Цена: {last_signal.get('price', '')}\n"
         "━━━━━━━━━━━━━━━━"
     )
 
@@ -213,12 +213,12 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
 
     if command == "/status":
         tg_send(
-            "🧠 СТАТУС СИСТЕМЫ\n"
+            "🧠 Статус системы\n"
             "━━━━━━━━━━━━━━━━\n"
-            f"🪙 Анализ активов      : {len(SYMBOLS)}\n"
-            f"⏱ Таймфрейм           : {TIMEFRAME}\n"
-            f"🔄 Проверка            : каждые {CHECK_EVERY_SECONDS} сек\n"
-            f"🎯 Мин. уверенность    : {MIN_CONFIDENCE}%\n"
+            f"🪙 Анализ активов: {len(SYMBOLS)}\n"
+            f"⏱ Таймфрейм: {TIMEFRAME}\n"
+            f"🔄 Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
+            f"🎯 Мин. уверенность: {MIN_CONFIDENCE}%\n"
             "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
@@ -242,16 +242,16 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
 
     if command == "/help":
         tg_send(
-            "ℹ️ ПОМОЩЬ\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "📊 Статус        — состояние системы\n"
-            "📌 Сигналы       — последний сигнал\n"
-            "🎯 Confidence    — текущая уверенность\n"
-            "⚙️ SetConfidence — изменить уверенность\n"
-            "⏸ Пауза         — остановить сигналы\n"
-            "▶️ Резюм         — включить сигналы\n"
-            "⚡ Сейчас        — внеочередной анализ\n"
-            "━━━━━━━━━━━━━━━━",
+            "ℹ️ Помощь\n"
+            "━━━━━━━━━━━━\n"
+            "📊 Статус\n"
+            "📌 Сигналы\n"
+            "🎯 Confidence\n"
+            "⚙️ SetConfidence\n"
+            "⏸ Пауза\n"
+            "▶️ Резюм\n"
+            "⚡ Сейчас\n"
+            "━━━━━━━━━━━━",
             chat_id=chat_id,
         )
         return
