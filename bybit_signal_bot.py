@@ -70,6 +70,33 @@ def tg_send(
         return False
 
 
+def tg_edit_message(
+    text: str,
+    chat_id: int,
+    message_id: int,
+    reply_markup: Optional[Dict] = None,
+) -> bool:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"[TG] editMessageText failed: {r.status_code} {r.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[TG] editMessageText exception: {e}")
+        return False
+
+
 def tg_get_updates(offset: int) -> List[Dict]:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     r = requests.get(url, params={"offset": offset, "timeout": 15}, timeout=20)
@@ -98,6 +125,27 @@ def main_keyboard() -> Dict:
         "resize_keyboard": True,
         "one_time_keyboard": False,
         "is_persistent": True,
+    }
+
+
+ALLOWED_EXCHANGES = {"bybit", "binance", "okx", "bingx"}
+
+
+def exchange_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Bybit", "callback_data": "exchange:set:bybit"},
+                {"text": "Binance", "callback_data": "exchange:set:binance"},
+            ],
+            [
+                {"text": "OKX", "callback_data": "exchange:set:okx"},
+                {"text": "BingX", "callback_data": "exchange:set:bingx"},
+            ],
+            [
+                {"text": "⬅ Назад", "callback_data": "menu:help"},
+            ],
+        ]
     }
 
 
@@ -144,6 +192,30 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
         f"💰 Цена: {last_signal.get('price', '')}\n"
         "━━━━━━━━━━━━━━━━"
     )
+
+
+def build_exchange_url(exchange_id: str, pair_text: str) -> str:
+    p = pair_text.replace(" ", "")
+    if "/" in p:
+        base, quote = p.split("/", 1)
+        symbol = base + quote
+    else:
+        symbol = p
+        if symbol.endswith("USDT"):
+            base, quote = symbol[:-4], "USDT"
+        else:
+            base, quote = symbol, "USDT"
+
+    if exchange_id == "bybit":
+        return f"https://www.bybit.com/trade/usdt/{symbol}"
+    if exchange_id == "binance":
+        return f"https://www.binance.com/en/futures/{symbol}"
+    if exchange_id == "bingx":
+        return f"https://bingx.com/en/futures/forward/{symbol}"
+    if exchange_id == "okx":
+        return f"https://www.okx.com/trade-swap/{base.lower()}-{quote.lower()}-swap"
+
+    return f"https://www.bybit.com/trade/usdt/{symbol}"
 
 
 def format_now_signal(last_signal: Dict) -> str:
@@ -277,6 +349,9 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
                     [
                         {"text": "⏸ Пауза", "callback_data": "cmd:pause"},
                         {"text": "▶️ Резюм", "callback_data": "cmd:resume"},
+                    ],
+                    [
+                        {"text": "📈 Биржа", "callback_data": "menu:exchange"},
                     ],
                 ]
             },
@@ -737,7 +812,17 @@ def run_signal_cycle(
     )
 
     if send_signals:
-        tg_send(msg)
+        with state_lock:
+            ex_id = state.get("exchange", "bybit")
+        url = build_exchange_url(ex_id, pair_text)
+        tg_send(
+            msg,
+            reply_markup={
+                "inline_keyboard": [
+                    [{"text": "Открыть на бирже", "url": url}],
+                ]
+            },
+        )
 
     last_signal = {
         "pair": normalize_symbol(symbol),
@@ -804,6 +889,30 @@ def command_loop(state: Dict) -> None:
                     chat = message.get("chat", {})
                     chat_id = chat.get("id")
                     if chat_id != TELEGRAM_CHAT_ID:
+                        continue
+                    if data == "menu:exchange":
+                        tg_edit_message(
+                            text="🏦 Выберите биржу\n━━━━━━━━━━━━━━━━",
+                            chat_id=chat_id,
+                            message_id=message.get("message_id"),
+                            reply_markup=exchange_keyboard(),
+                        )
+                        continue
+                    if data == "menu:help":
+                        handle_command("/help", chat_id, state)
+                        continue
+                    if data.startswith("exchange:set:"):
+                        exchange_id = data.split(":")[-1].lower().strip()
+                        if exchange_id in ALLOWED_EXCHANGES:
+                            with state_lock:
+                                state["exchange"] = exchange_id
+                                save_state(state)
+                            upper = exchange_id.upper()
+                            tg_send(
+                                f"🤖 Биржа {upper} выбрана\n"
+                                f"Ваши сигналы будут переходить на биржу {upper}.",
+                                chat_id=chat_id,
+                            )
                         continue
                     cmd = CALLBACK_TO_COMMAND.get(data)
                     if cmd:
@@ -917,6 +1026,7 @@ def main() -> None:
         state.setdefault("awaiting_confidence", False)
         state.setdefault("paused", False)
         state.setdefault("last_signal", None)
+        state.setdefault("exchange", "bybit")
         try:
             MIN_CONFIDENCE = int(state.get("min_confidence", default_confidence))
         except (TypeError, ValueError):
