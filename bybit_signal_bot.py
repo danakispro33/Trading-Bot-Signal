@@ -119,8 +119,8 @@ def main_keyboard() -> Dict:
         "keyboard": [
             [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
             [{"text": "📌 Сигналы"}, {"text": "🎯 Confidence"}],
+            [{"text": "⚙️ SetConfidence"}, {"text": "⏯ Старт / Пауза"}],
             [{"text": "🏦 Биржа"}],
-            [{"text": "⚙️ SetConfidence"}, {"text": "⏸ Пауза"}, {"text": "▶️ Резюм"}],
             [{"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
@@ -158,9 +158,9 @@ def build_help_text() -> str:
         "📌 Сигналы\n"
         "🎯 Confidence\n"
         "⚙️ SetConfidence\n"
-        "⏸ Пауза\n"
-        "▶️ Резюм\n"
+        "⏯ Старт / Пауза\n"
         "⚡ Сейчас\n"
+        "🏦 Биржа\n"
         "━━━━━━━━━━━━"
     )
 
@@ -180,10 +180,7 @@ def help_inline_keyboard() -> Dict:
                 {"text": "⚙️ SetConfidence", "callback_data": "cmd:setconfidence"},
             ],
             [
-                {"text": "⏸ Пауза", "callback_data": "cmd:pause"},
-                {"text": "▶️ Резюм", "callback_data": "cmd:resume"},
-            ],
-            [
+                {"text": "⏯ Старт / Пауза", "callback_data": "cmd:toggle"},
                 {"text": "🏦 Биржа", "callback_data": "menu:exchange"},
             ],
         ]
@@ -429,6 +426,17 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
+        return
+
+    if command == "/toggle":
+        with state_lock:
+            is_paused = state.get("paused", False)
+            state["paused"] = not is_paused
+            save_state(state)
+        if is_paused:
+            tg_send("▶️ Бот возобновлён", chat_id=chat_id)
+        else:
+            tg_send("⏸ Бот поставлен на паузу", chat_id=chat_id)
         return
 
     if command == "/resume":
@@ -878,8 +886,7 @@ def command_loop(state: Dict) -> None:
         "🎯 Confidence": "/confidence",
         "🏦 Биржа": "/exchange",
         "⚙️ SetConfidence": "/setconfidence",
-        "⏸ Пауза": "/pause",
-        "▶️ Резюм": "/resume",
+        "⏯ Старт / Пауза": "/toggle",
         "ℹ️ Помощь": "/help",
     }
     CALLBACK_TO_COMMAND = {
@@ -887,8 +894,7 @@ def command_loop(state: Dict) -> None:
         "cmd:signals": "/signals",
         "cmd:confidence": "/confidence",
         "cmd:setconfidence": "/setconfidence",
-        "cmd:pause": "/pause",
-        "cmd:resume": "/resume",
+        "cmd:toggle": "/toggle",
         "cmd:now": "/now",
     }
     # flush old updates on startup (do not process backlog)
