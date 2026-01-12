@@ -119,6 +119,7 @@ def main_keyboard() -> Dict:
         "keyboard": [
             [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
             [{"text": "📌 Сигналы"}, {"text": "🎯 Confidence"}],
+            [{"text": "🏦 Биржа"}],
             [{"text": "⚙️ SetConfidence"}, {"text": "⏸ Пауза"}, {"text": "▶️ Резюм"}],
             [{"text": "ℹ️ Помощь"}],
         ],
@@ -355,6 +356,15 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
                     ],
                 ]
             },
+        )
+        return
+
+    if command == "/exchange":
+        tg_send(
+            "🏦 Выберите биржу\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+            reply_markup=exchange_keyboard(),
         )
         return
 
@@ -849,6 +859,7 @@ def command_loop(state: Dict) -> None:
         "⚡ Сейчас": "/now",
         "📌 Сигналы": "/signals",
         "🎯 Confidence": "/confidence",
+        "🏦 Биржа": "/exchange",
         "⚙️ SetConfidence": "/setconfidence",
         "⏸ Пауза": "/pause",
         "▶️ Резюм": "/resume",
