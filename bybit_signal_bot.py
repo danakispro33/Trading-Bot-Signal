@@ -150,6 +150,46 @@ def exchange_keyboard() -> Dict:
     }
 
 
+def build_help_text() -> str:
+    return (
+        "ℹ️ Помощь\n"
+        "━━━━━━━━━━━━\n"
+        "📊 Статус\n"
+        "📌 Сигналы\n"
+        "🎯 Confidence\n"
+        "⚙️ SetConfidence\n"
+        "⏸ Пауза\n"
+        "▶️ Резюм\n"
+        "⚡ Сейчас\n"
+        "━━━━━━━━━━━━"
+    )
+
+
+def help_inline_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Статус", "callback_data": "cmd:status"},
+                {"text": "⚡ Сейчас", "callback_data": "cmd:now"},
+            ],
+            [
+                {"text": "📌 Сигналы", "callback_data": "cmd:signals"},
+                {"text": "🎯 Confidence", "callback_data": "cmd:confidence"},
+            ],
+            [
+                {"text": "⚙️ SetConfidence", "callback_data": "cmd:setconfidence"},
+            ],
+            [
+                {"text": "⏸ Пауза", "callback_data": "cmd:pause"},
+                {"text": "▶️ Резюм", "callback_data": "cmd:resume"},
+            ],
+            [
+                {"text": "🏦 Биржа", "callback_data": "menu:exchange"},
+            ],
+        ]
+    }
+
+
 # ================== STATE ==================
 def load_state() -> Dict:
     try:
@@ -184,10 +224,14 @@ def format_last_signal(last_signal: Optional[Dict]) -> str:
     direction_map = {"UP": "ВВЕРХ", "DOWN": "ВНИЗ"}
     direction = direction_map.get(last_signal.get("direction"), last_signal.get("direction", ""))
     probability = last_signal.get("probability")
+    pair = last_signal.get("pair", "")
+    display_pair = pair
+    if pair and "/" not in pair:
+        display_pair = f"{pair}/USDT"
     return (
         "📌 Последний сигнал\n"
         "━━━━━━━━━━━━━━━━\n"
-        f"💱 Пара: {last_signal.get('pair', '')}\n"
+        f"💱 Пара: {display_pair}\n"
         f"🔀 Направление: {direction}\n"
         f"🎯 Вероятность: {probability}%\n"
         f"💰 Цена: {last_signal.get('price', '')}\n"
@@ -293,6 +337,8 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         return
 
     if command == "/status":
+        with state_lock:
+            exchange = state.get("exchange", "bybit")
         tg_send(
             "🧠 Статус системы\n"
             "━━━━━━━━━━━━━━━━\n"
@@ -300,6 +346,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             f"⏱ Таймфрейм: {TIMEFRAME}\n"
             f"🔄 Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
             f"🎯 Мин. уверенность: {MIN_CONFIDENCE}%\n"
+            f"🏦 Биржа: {exchange}\n"
             "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
@@ -323,39 +370,9 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
 
     if command == "/help":
         tg_send(
-            "ℹ️ Помощь\n"
-            "━━━━━━━━━━━━\n"
-            "📊 Статус\n"
-            "📌 Сигналы\n"
-            "🎯 Confidence\n"
-            "⚙️ SetConfidence\n"
-            "⏸ Пауза\n"
-            "▶️ Резюм\n"
-            "⚡ Сейчас\n"
-            "━━━━━━━━━━━━",
+            build_help_text(),
             chat_id=chat_id,
-            reply_markup={
-                "inline_keyboard": [
-                    [
-                        {"text": "📊 Статус", "callback_data": "cmd:status"},
-                        {"text": "⚡ Сейчас", "callback_data": "cmd:now"},
-                    ],
-                    [
-                        {"text": "🎯 Сигналы", "callback_data": "cmd:signals"},
-                        {"text": "🧪 Confidence", "callback_data": "cmd:confidence"},
-                    ],
-                    [
-                        {"text": "⚙️ SetConfidence", "callback_data": "cmd:setconfidence"},
-                    ],
-                    [
-                        {"text": "⏸ Пауза", "callback_data": "cmd:pause"},
-                        {"text": "▶️ Резюм", "callback_data": "cmd:resume"},
-                    ],
-                    [
-                        {"text": "📈 Биржа", "callback_data": "menu:exchange"},
-                    ],
-                ]
-            },
+            reply_markup=help_inline_keyboard(),
         )
         return
 
@@ -371,7 +388,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
     if command == "/setconfidence":
         if len(parts) == 2 and parts[1].isdigit():
             value = int(parts[1])
-            if 0 <= value <= 100:
+            if 1 <= value <= 99:
                 with state_lock:
                     MIN_CONFIDENCE = value
                     state["min_confidence"] = value
@@ -391,13 +408,13 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             tg_send(
                 "⚙️ УСТАНОВКА УВЕРЕННОСТИ\n"
                 "━━━━━━━━━━━━━━━━\n"
-                "Введите значение от 1 до 99\n"
+                "Введите значение 1–99\n"
                 "Например: 65\n"
                 "━━━━━━━━━━━━━━━━",
                 chat_id=chat_id,
             )
             return
-        tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
+        tg_send("❌ Введите число 1–99.", chat_id=chat_id)
         return
 
     if command == "/pause":
@@ -910,7 +927,12 @@ def command_loop(state: Dict) -> None:
                         )
                         continue
                     if data == "menu:help":
-                        handle_command("/help", chat_id, state)
+                        tg_edit_message(
+                            text=build_help_text(),
+                            chat_id=chat_id,
+                            message_id=message.get("message_id"),
+                            reply_markup=help_inline_keyboard(),
+                        )
                         continue
                     if data.startswith("exchange:set:"):
                         exchange_id = data.split(":")[-1].lower().strip()
@@ -957,9 +979,9 @@ def command_loop(state: Dict) -> None:
                                 chat_id=chat_id,
                             )
                         else:
-                            tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
+                            tg_send("❌ Введите число 1–99.", chat_id=chat_id)
                     else:
-                        tg_send("❌ Введите число от 1 до 99.", chat_id=chat_id)
+                        tg_send("❌ Введите число 1–99.", chat_id=chat_id)
                     continue
                 cmd = None
                 if text.startswith("/"):
