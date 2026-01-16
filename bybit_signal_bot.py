@@ -235,7 +235,7 @@ def help_inline_keyboard() -> Dict:
         "inline_keyboard": [
             [
                 {"text": "📊 Статус", "callback_data": "cmd:status"},
-                {"text": "⚡ Сейчас", "callback_data": "cmd:now"},
+                {"text": "⚡ Сейчас", "callback_data": "cmd:now_menu"},
             ],
             [
                 {"text": "📌 Сигналы", "callback_data": "cmd:signals"},
@@ -249,6 +249,91 @@ def help_inline_keyboard() -> Dict:
             ],
         ]
     }
+
+
+def now_inline_menu_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "⚡ Внеочередной анализ", "callback_data": "now:run"}],
+            [{"text": "📰 Новости", "callback_data": "now:news"}],
+            [{"text": "✖ Закрыть", "callback_data": "ui:close"}],
+        ]
+    }
+
+
+def news_inline_menu_keyboard(state: Dict) -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "📰 Показать новости", "callback_data": "news:show"}],
+            [
+                {"text": "✅ Вкл", "callback_data": "news:on"},
+                {"text": "⛔ Выкл", "callback_data": "news:off"},
+            ],
+            [
+                {"text": "🎚 Уровень", "callback_data": "news:level_menu"},
+                {"text": "📡 Источники", "callback_data": "news:sources"},
+            ],
+            [{"text": "🧪 Тест", "callback_data": "news:test"}],
+            [
+                {"text": "⬅ Назад", "callback_data": "ui:back_now"},
+                {"text": "✖ Закрыть", "callback_data": "ui:close"},
+            ],
+        ]
+    }
+
+
+def news_level_inline_menu_keyboard(current_level: int) -> Dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "55", "callback_data": "news:level:55"},
+                {"text": "65", "callback_data": "news:level:65"},
+                {"text": "75", "callback_data": "news:level:75"},
+            ],
+            [
+                {"text": "85", "callback_data": "news:level:85"},
+                {"text": "95", "callback_data": "news:level:95"},
+            ],
+            [
+                {"text": "⬅ Назад", "callback_data": "ui:back_news"},
+                {"text": "✖ Закрыть", "callback_data": "ui:close"},
+            ],
+        ]
+    }
+
+
+def build_now_menu_text() -> str:
+    return (
+        "⚡ Сейчас\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "Выберите действие:\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def build_news_menu_text(state: Dict) -> str:
+    with state_lock:
+        settings = state.get("news_settings", {})
+        enabled = settings.get("enabled", NEWS_ENABLED)
+        level = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+    status = "ON" if enabled else "OFF"
+    return (
+        "📰 Новости\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"Статус: {status}\n"
+        f"Уровень: {level}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def build_news_level_text(current_level: int) -> str:
+    return (
+        "🎚 Уровень новостей\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"Текущий: {current_level}\n"
+        "Выберите новый уровень:\n"
+        "━━━━━━━━━━━━━━━━"
+    )
 
 
 # ================== STATE ==================
@@ -407,6 +492,14 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             build_help_text(),
             chat_id=chat_id,
             reply_markup=help_inline_keyboard(),
+        )
+        return
+
+    if command == "/now_menu":
+        tg_send(
+            build_now_menu_text(),
+            chat_id=chat_id,
+            reply_markup=now_inline_menu_keyboard(),
         )
         return
 
@@ -2240,7 +2333,7 @@ def command_loop(state: Dict) -> None:
     update_offset = 0
     BUTTON_TO_COMMAND = {
         "📊 Статус": "/status",
-        "⚡ Сейчас": "/now",
+        "⚡ Сейчас": "/now_menu",
         "📌 Сигналы": "/signals",
         "🎯 Confidence": "/confidence",
         "⚙️ SetConfidence": "/setconfidence",
@@ -2254,6 +2347,7 @@ def command_loop(state: Dict) -> None:
         "cmd:setconfidence": "/setconfidence",
         "cmd:toggle": "/toggle",
         "cmd:now": "/now",
+        "cmd:now_menu": "/now_menu",
     }
     # flush old updates on startup (do not process backlog)
     try:
@@ -2280,11 +2374,135 @@ def command_loop(state: Dict) -> None:
                     message = callback_query.get("message", {})
                     chat = message.get("chat", {})
                     chat_id = chat.get("id")
+                    message_id = message.get("message_id")
                     if chat_id != TELEGRAM_CHAT_ID:
                         continue
-                    cmd = CALLBACK_TO_COMMAND.get(data)
-                    if cmd:
-                        handle_command(cmd, chat_id, state)
+                    if data.startswith("cmd:"):
+                        cmd = CALLBACK_TO_COMMAND.get(data)
+                        if cmd:
+                            handle_command(cmd, chat_id, state)
+                        continue
+                    if data == "now:run":
+                        handle_command("/now", chat_id, state)
+                        continue
+                    if data == "now:news":
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        else:
+                            tg_send(
+                                build_news_menu_text(state),
+                                chat_id=chat_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "ui:back_now":
+                        if message_id:
+                            tg_edit_message(
+                                build_now_menu_text(),
+                                chat_id,
+                                message_id,
+                                reply_markup=now_inline_menu_keyboard(),
+                            )
+                        else:
+                            tg_send(
+                                build_now_menu_text(),
+                                chat_id=chat_id,
+                                reply_markup=now_inline_menu_keyboard(),
+                            )
+                        continue
+                    if data == "ui:back_news":
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        else:
+                            tg_send(
+                                build_news_menu_text(state),
+                                chat_id=chat_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "ui:close":
+                        if message_id:
+                            tg_edit_message(
+                                "✅ Меню закрыто",
+                                chat_id,
+                                message_id,
+                                reply_markup={"inline_keyboard": []},
+                            )
+                        else:
+                            tg_send("✅ Меню закрыто", chat_id=chat_id)
+                        continue
+                    if data == "news:show":
+                        handle_command("/news", chat_id, state)
+                        continue
+                    if data == "news:on":
+                        handle_command("/news_on", chat_id, state)
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "news:off":
+                        handle_command("/news_off", chat_id, state)
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "news:sources":
+                        handle_command("/news_sources", chat_id, state)
+                        continue
+                    if data == "news:test":
+                        handle_command("/news_test", chat_id, state)
+                        continue
+                    if data == "news:level_menu":
+                        with state_lock:
+                            settings = state.get("news_settings", {})
+                            current_level = settings.get(
+                                "importance_threshold",
+                                NEWS_IMPORTANCE_THRESHOLD,
+                            )
+                        if message_id:
+                            tg_edit_message(
+                                build_news_level_text(current_level),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_level_inline_menu_keyboard(current_level),
+                            )
+                        else:
+                            tg_send(
+                                build_news_level_text(current_level),
+                                chat_id=chat_id,
+                                reply_markup=news_level_inline_menu_keyboard(current_level),
+                            )
+                        continue
+                    if data.startswith("news:level:"):
+                        level_part = data.split(":", 2)[-1]
+                        if level_part.isdigit():
+                            handle_command(f"/news_level {level_part}", chat_id, state)
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
                     continue
                 message = update.get("message")
                 if not message:
