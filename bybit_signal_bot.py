@@ -39,9 +39,59 @@ CHECK_EVERY_SECONDS = 60
 COOLDOWN_MINUTES = 90
 MIN_CONFIDENCE = 62
 
+# Engine v2 config
+ENGINE_V2_ENABLED = True
+ENGINE_V2_USE_MTF = True
+ENGINE_V2_USE_LIVE_TRIGGER = True
+ENGINE_V2_SETUP_ENABLED = True
+ENGINE_V2_ENTRY_ENABLED = True
+
+# Timeframes
+BASE_TIMEFRAME = TIMEFRAME
+HIGHER_TIMEFRAME = "1h"
+LOWER_TIMEFRAME = "5m"
+
+# Setup logic
+SETUP_DISTANCE_PCT = 0.25
+SETUP_MIN_SCORE = 0.55
+SETUP_COOLDOWN_MINUTES = 30
+SETUP_TTL_MINUTES = 120
+
+# Trigger logic
+TRIGGER_BUFFER_PCT = 0.03
+TRIGGER_CONFIRM_MODE = "retest"
+TRIGGER_RETEST_MAX_BARS = 6
+TRIGGER_MOMENTUM_ATR_MULT = 0.35
+
+# Filters
+FILTER_MIN_ADX_SETUP = 16
+FILTER_MIN_ADX_ENTRY = 18
+FILTER_MIN_VOL_RATIO_SETUP = 1.05
+FILTER_MIN_VOL_RATIO_ENTRY = 1.15
+FILTER_RSI_MAX_SETUP = 72
+FILTER_RSI_MIN_SETUP = 28
+
+# Risk mgmt
+RISK_ATR_MULT_SL = 1.6
+RISK_MIN_RR = 1.6
+RISK_MAX_SL_PCT = 2.5
+
+# Regime thresholds
+REGIME_ATR_PCT_HIGH = 1.6
+REGIME_ATR_PCT_LOW = 0.6
+REGIME_CHOP_ADX_MAX = 14
+
+# Scoring weights
+W_TREND = 0.25
+W_ADX = 0.20
+W_VOL = 0.20
+W_PROXIMITY = 0.20
+W_PATTERN = 0.15
+
 STATE_FILE = "state.json"
 state_lock = threading.Lock()
 run_now_request = {"chat_id": None}
+data_cache: Dict[Tuple[str, str], Tuple[float, Dict]] = {}
 
 
 # ================== TELEGRAM ==================
@@ -519,6 +569,539 @@ def adx(highs: List[float], lows: List[float], closes: List[float], period: int 
     return adx_value
 
 
+# ================== DATA LAYER ==================
+def fetch_ohlcv(
+    exchange: ccxt.bybit,
+    symbol: str,
+    timeframe: str,
+    limit: int = 300,
+) -> Optional[Dict[str, List[float]]]:
+    cache_key = (symbol, timeframe)
+    now = time.time()
+    cached = data_cache.get(cache_key)
+    if cached and now - cached[0] < 15:
+        return cached[1]
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        print(f"[DATA] fetch_ohlcv error {symbol} {timeframe}: {e}")
+        return None
+    if not ohlcv:
+        return None
+    highs = [row[2] for row in ohlcv]
+    lows = [row[3] for row in ohlcv]
+    closes = [row[4] for row in ohlcv]
+    volumes = [row[5] for row in ohlcv]
+    timestamps = [row[0] for row in ohlcv]
+    parsed = {
+        "highs": highs,
+        "lows": lows,
+        "closes": closes,
+        "volumes": volumes,
+        "timestamps": timestamps,
+    }
+    data_cache[cache_key] = (now, parsed)
+    return parsed
+
+
+def fetch_ticker_price(exchange: ccxt.bybit, symbol: str) -> Optional[float]:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        last_price = ticker.get("last")
+        if last_price is None:
+            return None
+        return float(last_price)
+    except Exception as e:
+        print(f"[DATA] fetch_ticker error {symbol}: {e}")
+        return None
+
+
+# ================== ANALYSIS ENGINE V2 ==================
+def _safe_slope(series: List[float], length: int = 5) -> float:
+    if len(series) <= length:
+        return 0.0
+    return (series[-1] - series[-length]) / max(length, 1)
+
+
+def _sma(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def _std(values: List[float], period: int) -> Optional[float]:
+    if len(values) < period:
+        return None
+    mean = sum(values[-period:]) / period
+    variance = sum((v - mean) ** 2 for v in values[-period:]) / period
+    return math.sqrt(variance)
+
+
+def trend_features(highs: List[float], lows: List[float], closes: List[float]) -> Dict:
+    if len(closes) < 200:
+        return {}
+    ema_fast_series = ema(closes, 50)
+    ema_slow_series = ema(closes, 200)
+    ema_fast_val = ema_fast_series[-1]
+    ema_slow_val = ema_slow_series[-1]
+    slope_fast = _safe_slope(ema_fast_series, 5)
+    price = closes[-1]
+    distance_to_slow = ((price - ema_slow_val) / ema_slow_val) * 100 if ema_slow_val else 0.0
+
+    n = 5
+    if len(highs) < n + 1 or len(lows) < n + 1:
+        structure = 0
+    else:
+        higher_high = highs[-1] > max(highs[-n - 1:-1])
+        higher_low = lows[-1] > min(lows[-n - 1:-1])
+        lower_high = highs[-1] < max(highs[-n - 1:-1])
+        lower_low = lows[-1] < min(lows[-n - 1:-1])
+        structure = 1 if higher_high and higher_low else -1 if lower_high and lower_low else 0
+
+    return {
+        "ema_fast": ema_fast_val,
+        "ema_slow": ema_slow_val,
+        "ema_fast_slope": slope_fast,
+        "distance_to_slow": distance_to_slow,
+        "structure": structure,
+    }
+
+
+def momentum_features(closes: List[float]) -> Dict:
+    if len(closes) < 20:
+        return {}
+    rsi_series = rsi(closes, 14)
+    rsi_val = rsi_series[-1]
+    rsi_slope = _safe_slope(rsi_series, 5)
+    roc = ((closes[-1] - closes[-6]) / closes[-6]) * 100 if len(closes) > 6 else 0.0
+    return {
+        "rsi": rsi_val,
+        "rsi_slope": rsi_slope,
+        "roc": roc,
+    }
+
+
+def volatility_features(highs: List[float], lows: List[float], closes: List[float]) -> Dict:
+    atr_val = atr(highs, lows, closes, 14)
+    if atr_val is None:
+        return {}
+    price = closes[-1]
+    atr_pct = (atr_val / price) * 100 if price else 0.0
+    bb_sma = _sma(closes, 20)
+    bb_std = _std(closes, 20)
+    bb_width = 0.0
+    if bb_sma is not None and bb_std is not None and bb_sma != 0:
+        upper = bb_sma + (2 * bb_std)
+        lower = bb_sma - (2 * bb_std)
+        bb_width = ((upper - lower) / bb_sma) * 100
+    return {
+        "atr": atr_val,
+        "atr_pct": atr_pct,
+        "bb_width": bb_width,
+    }
+
+
+def volume_features(volumes: List[float]) -> Dict:
+    vol_sma20 = _sma(volumes, 20)
+    if vol_sma20 is None or vol_sma20 <= 0:
+        return {}
+    vol_ratio = volumes[-1] / vol_sma20
+    vol_slope = _safe_slope(volumes, 5)
+    return {
+        "vol_sma20": vol_sma20,
+        "vol_ratio": vol_ratio,
+        "vol_slope": vol_slope,
+    }
+
+
+def level_features(highs: List[float], lows: List[float], closes: List[float]) -> Dict:
+    n = 20
+    if len(highs) < n + 1 or len(lows) < n + 1:
+        return {}
+    high_n_prev = max(highs[-n - 1:-1])
+    low_n_prev = min(lows[-n - 1:-1])
+    compression_window = 8
+    if len(highs) < compression_window or len(lows) < compression_window:
+        compression = 0.0
+    else:
+        recent_range = max(highs[-compression_window:]) - min(lows[-compression_window:])
+        atr_val = atr(highs, lows, closes, 14) or 0.0
+        compression = (recent_range / atr_val) if atr_val else 0.0
+
+    price = closes[-1]
+    dist_to_high = ((high_n_prev - price) / price) * 100 if price else 0.0
+    dist_to_low = ((price - low_n_prev) / price) * 100 if price else 0.0
+    return {
+        "high_n_prev": high_n_prev,
+        "low_n_prev": low_n_prev,
+        "dist_to_high_pct": dist_to_high,
+        "dist_to_low_pct": dist_to_low,
+        "compression": compression,
+    }
+
+
+def build_features(base_data: Dict[str, List[float]]) -> Dict:
+    highs = base_data["highs"]
+    lows = base_data["lows"]
+    closes = base_data["closes"]
+    volumes = base_data["volumes"]
+    features = {}
+    features.update(trend_features(highs, lows, closes))
+    features.update(momentum_features(closes))
+    features.update(volatility_features(highs, lows, closes))
+    features.update(volume_features(volumes))
+    features.update(level_features(highs, lows, closes))
+    adx_val = adx(highs, lows, closes, 14)
+    if adx_val is not None:
+        features["adx"] = adx_val
+    return features
+
+
+def detect_regime(features: Dict) -> str:
+    atr_pct = features.get("atr_pct", 0)
+    adx_val = features.get("adx", 0)
+    ema_fast_val = features.get("ema_fast")
+    ema_slow_val = features.get("ema_slow")
+    trend_up = ema_fast_val is not None and ema_slow_val is not None and ema_fast_val > ema_slow_val
+    trend_down = ema_fast_val is not None and ema_slow_val is not None and ema_fast_val < ema_slow_val
+
+    if atr_pct >= REGIME_ATR_PCT_HIGH:
+        return "HIGH_VOLATILITY"
+    if atr_pct <= REGIME_ATR_PCT_LOW:
+        return "LOW_VOLATILITY"
+    if adx_val <= REGIME_CHOP_ADX_MAX:
+        return "CHOP"
+    if adx_val >= 22 and trend_up:
+        return "TREND_UP"
+    if adx_val >= 22 and trend_down:
+        return "TREND_DOWN"
+    return "RANGE"
+
+
+def _score_setup(features: Dict, proximity: float, pattern_score: float) -> float:
+    trend_score = 1.0 if abs(features.get("ema_fast", 0) - features.get("ema_slow", 0)) > 0 else 0.0
+    adx_score = clamp((features.get("adx", 0) - 14) / 20, 0, 1)
+    vol_score = clamp((features.get("vol_ratio", 1) - 1) / 0.8, 0, 1)
+    proximity_score = clamp(1 - (proximity / max(SETUP_DISTANCE_PCT, 0.01)), 0, 1)
+    setup_score = (
+        W_TREND * trend_score
+        + W_ADX * adx_score
+        + W_VOL * vol_score
+        + W_PROXIMITY * proximity_score
+        + W_PATTERN * pattern_score
+    )
+    return clamp(setup_score, 0, 1)
+
+
+def generate_setups(
+    symbol: str,
+    base_data: Dict[str, List[float]],
+    higher_data: Optional[Dict[str, List[float]]],
+    features: Dict,
+    regime: str,
+) -> List[Dict]:
+    if regime in {"CHOP", "HIGH_VOLATILITY"}:
+        return []
+    if features.get("adx", 0) < FILTER_MIN_ADX_SETUP:
+        return []
+    if features.get("vol_ratio", 0) < FILTER_MIN_VOL_RATIO_SETUP:
+        return []
+    rsi_val = features.get("rsi", 50)
+    if rsi_val >= FILTER_RSI_MAX_SETUP or rsi_val <= FILTER_RSI_MIN_SETUP:
+        return []
+
+    compression = features.get("compression", 0.0)
+    pattern_score = clamp(1 - (compression / 4), 0, 1) if compression else 0.0
+    setups = []
+    price = base_data["closes"][-1]
+
+    def _mtf_direction() -> Optional[str]:
+        if not higher_data or not ENGINE_V2_USE_MTF:
+            return None
+        higher_features = build_features(higher_data)
+        ema_fast_val = higher_features.get("ema_fast")
+        ema_slow_val = higher_features.get("ema_slow")
+        if ema_fast_val is None or ema_slow_val is None:
+            return None
+        if ema_fast_val > ema_slow_val:
+            return "LONG"
+        if ema_fast_val < ema_slow_val:
+            return "SHORT"
+        return None
+
+    mtf_direction = _mtf_direction()
+    dist_to_high = abs(features.get("dist_to_high_pct", 999))
+    dist_to_low = abs(features.get("dist_to_low_pct", 999))
+
+    if dist_to_high <= SETUP_DISTANCE_PCT:
+        if mtf_direction in (None, "LONG"):
+            setup_score = _score_setup(features, dist_to_high, pattern_score)
+            if setup_score >= SETUP_MIN_SCORE:
+                setups.append({
+                    "symbol": symbol,
+                    "direction": "LONG",
+                    "level": features.get("high_n_prev"),
+                    "setup_score": setup_score,
+                    "created_at": time.time(),
+                    "expires_at": time.time() + (SETUP_TTL_MINUTES * 60),
+                    "rationale": "trend/volume/compression/level",
+                    "distance_pct": dist_to_high,
+                })
+
+    if dist_to_low <= SETUP_DISTANCE_PCT:
+        if mtf_direction in (None, "SHORT"):
+            setup_score = _score_setup(features, dist_to_low, pattern_score)
+            if setup_score >= SETUP_MIN_SCORE:
+                setups.append({
+                    "symbol": symbol,
+                    "direction": "SHORT",
+                    "level": features.get("low_n_prev"),
+                    "setup_score": setup_score,
+                    "created_at": time.time(),
+                    "expires_at": time.time() + (SETUP_TTL_MINUTES * 60),
+                    "rationale": "trend/volume/compression/level",
+                    "distance_pct": dist_to_low,
+                })
+    return setups
+
+
+def _entry_risk_targets(
+    direction: str,
+    entry_price: float,
+    level: float,
+    atr_val: float,
+    base_data: Dict[str, List[float]],
+) -> Optional[Dict]:
+    lows = base_data["lows"]
+    highs = base_data["highs"]
+    if direction == "LONG":
+        swing = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+        sl = min(swing, entry_price - (RISK_ATR_MULT_SL * atr_val))
+        risk = entry_price - sl
+        tp = entry_price + (RISK_MIN_RR * risk)
+    else:
+        swing = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+        sl = max(swing, entry_price + (RISK_ATR_MULT_SL * atr_val))
+        risk = sl - entry_price
+        tp = entry_price - (RISK_MIN_RR * risk)
+    if risk <= 0:
+        return None
+    sl_pct = (risk / entry_price) * 100 if entry_price else 0
+    if sl_pct > RISK_MAX_SL_PCT:
+        return None
+    return {"sl": sl, "tp": tp, "risk": risk}
+
+
+def check_trigger(
+    setup: Dict,
+    live_price: float,
+    base_data: Dict[str, List[float]],
+    features: Dict,
+) -> Optional[Dict]:
+    direction = setup["direction"]
+    level = setup["level"]
+    if level is None:
+        return None
+    atr_val = features.get("atr")
+    if atr_val is None:
+        return None
+    closes = base_data["closes"]
+    highs = base_data["highs"]
+    lows = base_data["lows"]
+    buffer = level * (TRIGGER_BUFFER_PCT / 100)
+    if direction == "LONG":
+        breakout_price = level + buffer
+        breakout_ok = live_price > breakout_price
+        retest_ok = min(lows[-TRIGGER_RETEST_MAX_BARS:]) <= breakout_price if len(lows) >= TRIGGER_RETEST_MAX_BARS else False
+        momentum_ok = (highs[-1] - highs[-2]) >= TRIGGER_MOMENTUM_ATR_MULT * atr_val if len(highs) > 1 else False
+    else:
+        breakout_price = level - buffer
+        breakout_ok = live_price < breakout_price
+        retest_ok = max(highs[-TRIGGER_RETEST_MAX_BARS:]) >= breakout_price if len(highs) >= TRIGGER_RETEST_MAX_BARS else False
+        momentum_ok = (lows[-2] - lows[-1]) >= TRIGGER_MOMENTUM_ATR_MULT * atr_val if len(lows) > 1 else False
+
+    if TRIGGER_CONFIRM_MODE == "close":
+        trigger_ok = breakout_ok and ((closes[-1] > breakout_price) if direction == "LONG" else (closes[-1] < breakout_price))
+    elif TRIGGER_CONFIRM_MODE == "momentum":
+        trigger_ok = breakout_ok and momentum_ok
+    else:
+        trigger_ok = breakout_ok and retest_ok
+
+    if not trigger_ok:
+        return None
+
+    if features.get("adx", 0) < FILTER_MIN_ADX_ENTRY:
+        return None
+    if features.get("vol_ratio", 0) < FILTER_MIN_VOL_RATIO_ENTRY:
+        return None
+
+    entry_price = live_price
+    risk_targets = _entry_risk_targets(direction, entry_price, level, atr_val, base_data)
+    if not risk_targets:
+        return None
+
+    setup_score = setup.get("setup_score", 0.0)
+    trigger_bonus = 0.15 if TRIGGER_CONFIRM_MODE == "retest" else 0.1
+    entry_score = clamp(setup_score + trigger_bonus, 0, 1)
+    confidence = clamp(50 + entry_score * 45, 50, 95)
+    return {
+        "entry_price": entry_price,
+        "sl": risk_targets["sl"],
+        "tp": risk_targets["tp"],
+        "confidence": confidence,
+        "entry_score": entry_score,
+    }
+
+
+def format_setup_message(setup: Dict) -> str:
+    symbol = setup["symbol"]
+    direction = setup["direction"]
+    level = setup["level"]
+    distance_pct = setup.get("distance_pct", 0)
+    setup_score = setup.get("setup_score", 0) * 100
+    timeframe_line = BASE_TIMEFRAME
+    if ENGINE_V2_USE_MTF:
+        timeframe_line = f"{BASE_TIMEFRAME} (MTF: {HIGHER_TIMEFRAME})"
+    return (
+        "◉ СЕТАП (РАНО)\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📌 Пара: {normalize_symbol(symbol)} / USDT\n"
+        f"📈 Направление: {direction}\n"
+        f"🎯 Уровень: {format_price(level)}\n"
+        f"📏 До уровня: {distance_pct:.2f}%\n"
+        f"🧠 Готовность: {setup_score:.2f}%\n"
+        f"⏱ Таймфрейм: {timeframe_line}\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "⚠️ Это сетап: вход будет при подтверждении."
+    )
+
+
+def format_entry_message(symbol: str, direction: str, entry: Dict) -> str:
+    return (
+        "◉ СИГНАЛ\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📌 Пара: {normalize_symbol(symbol)} / USDT\n"
+        f"📈 Направление: {direction}\n"
+        f"🎯 Вход: {format_price(entry['entry_price'])}\n"
+        f"🛑 SL: {format_price(entry['sl'])}\n"
+        f"✅ TP: {format_price(entry['tp'])}\n"
+        f"🎯 Уверенность: {entry['confidence']:.2f}%\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def cleanup_open_setups(state: Dict) -> None:
+    open_setups = state.get("open_setups", {})
+    now = time.time()
+    to_delete = []
+    for key, setup in open_setups.items():
+        if setup.get("expires_at", 0) <= now:
+            to_delete.append(key)
+            continue
+        invalidation = setup.get("invalidation")
+        if invalidation and now >= invalidation:
+            to_delete.append(key)
+    for key in to_delete:
+        open_setups.pop(key, None)
+    state["open_setups"] = open_setups
+
+
+def engine_v2_cycle(
+    exchange: ccxt.bybit,
+    state: Dict,
+    send_signals: bool,
+    allow_cooldown: bool,
+) -> Optional[Dict]:
+    last_signal = None
+    cleanup_open_setups(state)
+    for symbol in SYMBOLS:
+        base_data = fetch_ohlcv(exchange, symbol, BASE_TIMEFRAME, limit=300)
+        if not base_data:
+            continue
+        if len(base_data["closes"]) < 220:
+            continue
+        higher_data = None
+        if ENGINE_V2_USE_MTF:
+            higher_data = fetch_ohlcv(exchange, symbol, HIGHER_TIMEFRAME, limit=300)
+        features = build_features(base_data)
+        if not features:
+            continue
+        regime = detect_regime(features)
+        setups = generate_setups(symbol, base_data, higher_data, features, regime) if ENGINE_V2_SETUP_ENABLED else []
+
+        print(f"[ENGINE_V2] {symbol} regime={regime} setups={len(setups)}")
+
+        with state_lock:
+            setup_memory = state.setdefault("setup_memory", {})
+            entry_memory = state.setdefault("entry_memory", {})
+            open_setups = state.setdefault("open_setups", {})
+
+        for setup in setups:
+            direction = setup["direction"]
+            setup_key = f"{symbol}_{direction}"
+            with state_lock:
+                last_setup_time = setup_memory.get(setup_key, 0)
+            if allow_cooldown and time.time() - last_setup_time < SETUP_COOLDOWN_MINUTES * 60:
+                continue
+            existing = open_setups.get(setup_key)
+            if existing:
+                continue
+            setup["invalidation"] = time.time() + (SETUP_TTL_MINUTES * 60)
+            if send_signals:
+                tg_send(format_setup_message(setup))
+            with state_lock:
+                setup_memory[setup_key] = time.time()
+                open_setups[setup_key] = setup
+                state["setup_memory"] = setup_memory
+                state["open_setups"] = open_setups
+                save_state(state)
+
+        if not ENGINE_V2_ENTRY_ENABLED:
+            continue
+
+        with state_lock:
+            open_setups = state.get("open_setups", {}).copy()
+        for setup_key, setup in open_setups.items():
+            if setup.get("symbol") != symbol:
+                continue
+            direction = setup["direction"]
+            entry_key = f"{symbol}_{direction}"
+            with state_lock:
+                last_entry_time = entry_memory.get(entry_key, 0)
+            if allow_cooldown and time.time() - last_entry_time < COOLDOWN_MINUTES * 60:
+                continue
+            live_price = None
+            if ENGINE_V2_USE_LIVE_TRIGGER:
+                live_price = fetch_ticker_price(exchange, symbol)
+            if live_price is None:
+                live_price = base_data["closes"][-1]
+
+            entry = check_trigger(setup, live_price, base_data, features)
+            if not entry:
+                continue
+            if entry["confidence"] < MIN_CONFIDENCE:
+                continue
+
+            if send_signals:
+                tg_send(format_entry_message(symbol, direction, entry))
+
+            last_signal = {
+                "pair": normalize_symbol(symbol),
+                "direction": "UP" if direction == "LONG" else "DOWN",
+                "confidence": round(entry["confidence"]),
+                "probability": round(entry["confidence"], 2),
+                "price": entry["entry_price"],
+            }
+            with state_lock:
+                entry_memory[entry_key] = time.time()
+                state["entry_memory"] = entry_memory
+                state["last_signal"] = last_signal
+                open_setups.pop(setup_key, None)
+                state["open_setups"] = open_setups
+                save_state(state)
+    return last_signal
+
+
 # ================== SIGNAL LOGIC ==================
 def compute_signal(
     highs: List[float],
@@ -680,6 +1263,9 @@ def run_signal_cycle(
     send_signals: bool,
     allow_cooldown: bool = True,
 ) -> Optional[Dict]:
+    if ENGINE_V2_ENABLED:
+        return engine_v2_cycle(exchange, state, send_signals, allow_cooldown)
+
     last_signal = None
     candidates = []
 
@@ -967,6 +1553,10 @@ def main() -> None:
         state.setdefault("awaiting_confidence", False)
         state.setdefault("paused", False)
         state.setdefault("last_signal", None)
+        state.setdefault("setup_memory", {})
+        state.setdefault("entry_memory", {})
+        state.setdefault("open_setups", {})
+        state.setdefault("engine_config_version", 1)
         try:
             MIN_CONFIDENCE = int(state.get("min_confidence", default_confidence))
         except (TypeError, ValueError):
@@ -975,6 +1565,10 @@ def main() -> None:
         save_state(state)
 
     # Сообщение при старте (должно прийти всегда)
+    print(
+        f"[ENGINE] v2={ENGINE_V2_ENABLED} base_tf={BASE_TIMEFRAME} "
+        f"mtf={ENGINE_V2_USE_MTF} higher_tf={HIGHER_TIMEFRAME}"
+    )
     tg_send(
         "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
         f"🧠 Анализ активов: {len(SYMBOLS)}\n"
