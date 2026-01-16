@@ -51,6 +51,11 @@ NEWS_ENABLED = True
 NEWS_POLL_SECONDS = 90
 NEWS_HTTP_TIMEOUT_RSS = (3, 6)
 NEWS_HTTP_TIMEOUT_API = (3, 8)
+NEWS_TRANSLATE_ENABLED = True
+NEWS_TRANSLATE_TARGET = "ru"
+NEWS_TRANSLATE_CACHE_LIMIT = 5000
+NEWS_TRANSLATE_TIMEOUT = (3, 6)
+NEWS_TRANSLATE_PROVIDER = "mymemory"
 NEWS_TEST_MAX_SECONDS = 12
 NEWS_MAX_ITEMS_PER_POLL = 50
 NEWS_STORE_LIMIT = 100
@@ -318,7 +323,7 @@ def build_news_menu_text(state: Dict) -> str:
     with state_lock:
         settings = state.get("news_settings", {})
         enabled = settings.get("enabled", NEWS_ENABLED)
-        level = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+        level = get_news_threshold(state, settings)
     status = "ON" if enabled else "OFF"
     return (
         "📰 Новости\n"
@@ -553,10 +558,10 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
                     "━━━━━━━━━━━━━━━━",
                     chat_id=chat_id,
                 )
-                return
+        return
         with state_lock:
             settings = state.get("news_settings", {})
-            current = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+            current = get_news_threshold(state, settings)
         tg_send(
             "📰 ПОРОГ ВАЖНОСТИ\n"
             "━━━━━━━━━━━━━━━━\n"
@@ -793,6 +798,82 @@ def normalize_url(url: Optional[str]) -> str:
 
 def normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", (title or "").strip().lower())
+
+
+def get_news_threshold(state: Dict, settings: Optional[Dict] = None) -> int:
+    if settings is None:
+        with state_lock:
+            settings = dict(state.get("news_settings", {}))
+    raw_threshold = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+    try:
+        return int(raw_threshold)
+    except (TypeError, ValueError):
+        return NEWS_IMPORTANCE_THRESHOLD
+
+
+def news_item_passes_threshold(item: NewsItem, threshold: int) -> bool:
+    importance = item.importance if item.importance is not None else 0
+    return importance >= threshold
+
+
+def _title_has_cyrillic(title: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", title or ""))
+
+
+def prune_translation_cache(cache: Dict[str, str]) -> None:
+    if len(cache) <= NEWS_TRANSLATE_CACHE_LIMIT:
+        return
+    remove_count = max(1, int(len(cache) * 0.2))
+    for key in list(cache.keys())[:remove_count]:
+        cache.pop(key, None)
+
+
+def _translate_title_mymemory(title_en: str) -> Optional[str]:
+    try:
+        response = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": title_en, "langpair": f"en|{NEWS_TRANSLATE_TARGET}"},
+            timeout=NEWS_TRANSLATE_TIMEOUT,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        translated = (
+            payload.get("responseData", {}).get("translatedText")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not translated or not isinstance(translated, str):
+            return None
+        return translated.strip()
+    except Exception:
+        return None
+
+
+def translate_title_to_ru(title_en: str, state: Dict) -> str:
+    if not title_en:
+        return ""
+    if not NEWS_TRANSLATE_ENABLED:
+        return title_en
+    if _title_has_cyrillic(title_en):
+        return title_en
+    cache_key = hashlib.sha1(title_en.encode("utf-8")).hexdigest()
+    with state_lock:
+        cache = state.setdefault("news_translate_cache", {})
+        cached = cache.get(cache_key)
+    if cached:
+        return cached
+    translated: Optional[str] = None
+    if NEWS_TRANSLATE_PROVIDER == "mymemory":
+        translated = _translate_title_mymemory(title_en)
+    if not translated:
+        return title_en
+    with state_lock:
+        cache = state.setdefault("news_translate_cache", {})
+        cache[cache_key] = translated
+        prune_translation_cache(cache)
+        save_state(state)
+    return translated
 
 
 def to_epoch(value: Optional[str]) -> int:
@@ -1091,9 +1172,10 @@ def news_item_from_dict(data: Dict) -> NewsItem:
     )
 
 
-def format_news_card(item: NewsItem) -> str:
+def format_news_card(item: NewsItem, state: Dict) -> str:
     coins = ", ".join(item.coins) if item.coins else "—"
     url = item.url or "—"
+    title_display = translate_title_to_ru(item.title, state)
     if item.urgency >= NEWS_URGENT_THRESHOLD:
         price_line = f"📈 {item.price_move}" if item.price_move else ""
         return (
@@ -1103,7 +1185,7 @@ def format_news_card(item: NewsItem) -> str:
             f"🏷 {item.category}\n"
             f"🔥 {item.importance}/100  ⏱ {item.urgency}/100\n"
             f"{price_line}\n"
-            f"🧠 {item.title}\n"
+            f"🧠 {title_display}\n"
             f"🔗 {url}\n"
             "━━━━━━━━━━━━━━━━"
         ).replace("\n\n", "\n")
@@ -1113,7 +1195,7 @@ def format_news_card(item: NewsItem) -> str:
         f"🪙 {coins}\n"
         f"🏷 {item.category}\n"
         f"🔥 {item.importance}/100\n"
-        f"🧠 {item.title}\n"
+        f"🧠 {title_display}\n"
         f"🔗 {url}\n"
         "━━━━━━━━━━━━━━━━"
     )
@@ -1122,6 +1204,7 @@ def format_news_card(item: NewsItem) -> str:
 def send_recent_news(chat_id: int, state: Dict) -> None:
     with state_lock:
         items_raw = list(state.get("news", []))
+    threshold = get_news_threshold(state)
     if not items_raw:
         tg_send(
             "📰 НОВОСТИ\n"
@@ -1133,11 +1216,21 @@ def send_recent_news(chat_id: int, state: Dict) -> None:
         return
     limit = min(len(items_raw), NEWS_SHOW_LIMIT)
     items = [news_item_from_dict(item) for item in items_raw[-limit:]]
+    items = [item for item in items if news_item_passes_threshold(item, threshold)]
+    if not items:
+        tg_send(
+            "📰 НОВОСТИ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "Пока нет новостей по вашему уровню\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
     items.reverse()
     chunks: List[str] = []
     current = ""
     for item in items:
-        card = format_news_card(item)
+        card = format_news_card(item, state)
         if len(current) + len(card) + 2 > 3500:
             if current:
                 chunks.append(current)
@@ -1177,7 +1270,7 @@ def news_poll_once(
         settings = dict(state.get("news_settings", {}))
         enabled = settings.get("enabled", NEWS_ENABLED)
         sources = dict(settings.get("sources") or NEWS_SOURCES)
-        threshold = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+        threshold = get_news_threshold(state, settings)
         price_check_enabled = settings.get("price_check", NEWS_PRICE_CHECK_ENABLED)
         news_seen = dict(state.get("news_seen", {}))
         news_list = list(state.get("news", []))
@@ -1272,25 +1365,25 @@ def news_poll_once(
 
     if publish:
         for item in new_items:
-            if item.importance < threshold:
+            if not news_item_passes_threshold(item, threshold):
                 continue
             if not item.url:
                 continue
-            tg_send(format_news_card(item))
+            tg_send(format_news_card(item, state))
 
     if test_mode and chat_id is not None:
-        preview = new_items[:3]
+        preview = [item for item in new_items if news_item_passes_threshold(item, threshold)][:3]
         if not preview:
             tg_send(
                 "🧪 TEST NEWS\n"
                 "━━━━━━━━━━━━━━━━\n"
-                "Нет свежих новостей\n"
+                f"⚠️ Новых новостей выше уровня {threshold} нет\n"
                 "━━━━━━━━━━━━━━━━",
                 chat_id=chat_id,
             )
         else:
             for item in preview:
-                tg_send(format_news_card(item), chat_id=chat_id)
+                tg_send(format_news_card(item, state), chat_id=chat_id)
 
     print(f"[NEWS] fetched {len(raw_all)} items, new {len(new_items)}")
     return new_items
@@ -1322,6 +1415,7 @@ def run_news_test_job(chat_id: int, state: Dict) -> None:
         with state_lock:
             settings = dict(state.get("news_settings", {}))
             sources = dict(settings.get("sources") or NEWS_SOURCES)
+            threshold = get_news_threshold(state, settings)
 
         providers = [provider for provider in ("cryptopanic", "rss", "gdelt") if sources.get(provider)]
         if not providers:
@@ -1398,12 +1492,21 @@ def run_news_test_job(chat_id: int, state: Dict) -> None:
             item.urgency = compute_urgency(item, repeated_count)
 
         raw_all.sort(key=lambda item: item.published_ts, reverse=True)
-        preview = raw_all[:3]
+        preview = [item for item in raw_all if news_item_passes_threshold(item, threshold)][:3]
+        if not preview:
+            tg_send(
+                "🧪 TEST NEWS\n"
+                "━━━━━━━━━━━━━━━━\n"
+                f"⚠️ Новых новостей выше уровня {threshold} нет\n"
+                "━━━━━━━━━━━━━━━━",
+                chat_id=chat_id,
+            )
+            return
         for item in preview:
             if time.time() - start_ts > NEWS_TEST_MAX_SECONDS:
                 _send_news_test_timeout(chat_id)
                 return
-            tg_send(format_news_card(item), chat_id=chat_id)
+            tg_send(format_news_card(item, state), chat_id=chat_id)
     except Exception as e:
         print(f"[NEWS TEST ERROR] {type(e).__name__}: {e}")
         tg_send("🧪 TEST NEWS: ошибка при выполнении", chat_id=chat_id)
@@ -2572,10 +2675,7 @@ def command_loop(state: Dict) -> None:
                     if data == "news:level_menu":
                         with state_lock:
                             settings = state.get("news_settings", {})
-                            current_level = settings.get(
-                                "importance_threshold",
-                                NEWS_IMPORTANCE_THRESHOLD,
-                            )
+                            current_level = get_news_threshold(state, settings)
                         if message_id:
                             tg_edit_message(
                                 build_news_level_text(current_level),
@@ -2723,6 +2823,7 @@ def main() -> None:
             "sources": NEWS_SOURCES.copy(),
             "price_check": NEWS_PRICE_CHECK_ENABLED,
         })
+        state.setdefault("news_translate_cache", {})
         state.setdefault("news_price_last_check", {})
         state.setdefault("news_last_poll_ts", 0)
         try:
