@@ -91,7 +91,8 @@ W_PATTERN = 0.15
 STATE_FILE = "state.json"
 state_lock = threading.Lock()
 run_now_request = {"chat_id": None}
-data_cache: Dict[Tuple[str, str], Tuple[float, Dict]] = {}
+_OHLCV_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
+_LAST_RL_LOG_TS = 0.0
 
 
 # ================== TELEGRAM ==================
@@ -570,20 +571,42 @@ def adx(highs: List[float], lows: List[float], closes: List[float], period: int 
 
 
 # ================== DATA LAYER ==================
-def fetch_ohlcv(
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "rate limit" in message
+        or "too many visits" in message
+        or "too many requests" in message
+        or "429" in message
+    )
+
+
+def _log_rate_limit_once(context: str) -> None:
+    global _LAST_RL_LOG_TS
+    now = time.time()
+    if now - _LAST_RL_LOG_TS >= 30:
+        print(f"[RATE_LIMIT] {context}")
+        _LAST_RL_LOG_TS = now
+
+
+def fetch_ohlcv_cached(
     exchange: ccxt.bybit,
     symbol: str,
     timeframe: str,
-    limit: int = 300,
-) -> Optional[Dict[str, List[float]]]:
-    cache_key = (symbol, timeframe)
+    limit: int,
+    ttl_seconds: int,
+) -> Optional[Tuple[List[float], List[float], List[float], List[float], List[float]]]:
     now = time.time()
-    cached = data_cache.get(cache_key)
-    if cached and now - cached[0] < 15:
-        return cached[1]
+    cache_key = (symbol, timeframe)
+    cached = _OHLCV_CACHE.get(cache_key)
+    if cached and now - float(cached["ts"]) < ttl_seconds:
+        return cached["parsed"]  # type: ignore[return-value]
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
+        if _is_rate_limit_error(e):
+            _log_rate_limit_once(f"fetch_ohlcv {symbol} {timeframe}")
+            return None
         print(f"[DATA] fetch_ohlcv error {symbol} {timeframe}: {e}")
         return None
     if not ohlcv:
@@ -593,27 +616,65 @@ def fetch_ohlcv(
     closes = [row[4] for row in ohlcv]
     volumes = [row[5] for row in ohlcv]
     timestamps = [row[0] for row in ohlcv]
-    parsed = {
+    parsed = (highs, lows, closes, volumes, timestamps)
+    _OHLCV_CACHE[cache_key] = {
+        "ts": now,
+        "ohlcv": ohlcv,
+        "parsed": parsed,
+    }
+    return parsed
+
+
+def _parsed_to_dict(
+    parsed: Tuple[List[float], List[float], List[float], List[float], List[float]],
+) -> Dict[str, List[float]]:
+    highs, lows, closes, volumes, timestamps = parsed
+    return {
         "highs": highs,
         "lows": lows,
         "closes": closes,
         "volumes": volumes,
         "timestamps": timestamps,
     }
-    data_cache[cache_key] = (now, parsed)
-    return parsed
 
 
-def fetch_ticker_price(exchange: ccxt.bybit, symbol: str) -> Optional[float]:
+def fetch_ohlcv_raw_cached(
+    exchange: ccxt.bybit,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    ttl_seconds: int,
+) -> Optional[List[List[float]]]:
+    parsed = fetch_ohlcv_cached(exchange, symbol, timeframe, limit, ttl_seconds)
+    if parsed is None:
+        return None
+    cached = _OHLCV_CACHE.get((symbol, timeframe))
+    if not cached:
+        return None
+    return cached.get("ohlcv")  # type: ignore[return-value]
+
+
+def get_live_price_if_needed(
+    exchange: ccxt.bybit,
+    symbol: str,
+    fallback_price: float,
+    has_active_setup: bool,
+) -> Optional[float]:
+    if not ENGINE_V2_USE_LIVE_TRIGGER:
+        return fallback_price
+    if not has_active_setup:
+        return fallback_price
     try:
         ticker = exchange.fetch_ticker(symbol)
-        last_price = ticker.get("last")
+        last_price = ticker.get("last") or ticker.get("close")
         if last_price is None:
-            return None
+            return fallback_price
         return float(last_price)
     except Exception as e:
-        print(f"[DATA] fetch_ticker error {symbol}: {e}")
-        return None
+        if _is_rate_limit_error(e):
+            _log_rate_limit_once(f"fetch_ticker {symbol}")
+            return None
+        return fallback_price
 
 
 # ================== ANALYSIS ENGINE V2 ==================
@@ -1015,14 +1076,17 @@ def engine_v2_cycle(
     last_signal = None
     cleanup_open_setups(state)
     for symbol in SYMBOLS:
-        base_data = fetch_ohlcv(exchange, symbol, BASE_TIMEFRAME, limit=300)
-        if not base_data:
+        # 15m TTL = 25s, 1h TTL = 600s (anti rate-limit, no behavior change)
+        base_parsed = fetch_ohlcv_cached(exchange, symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
+        if not base_parsed:
             continue
+        base_data = _parsed_to_dict(base_parsed)
         if len(base_data["closes"]) < 220:
             continue
         higher_data = None
         if ENGINE_V2_USE_MTF:
-            higher_data = fetch_ohlcv(exchange, symbol, HIGHER_TIMEFRAME, limit=300)
+            higher_parsed = fetch_ohlcv_cached(exchange, symbol, HIGHER_TIMEFRAME, limit=300, ttl_seconds=600)
+            higher_data = _parsed_to_dict(higher_parsed) if higher_parsed else None
         features = build_features(base_data)
         if not features:
             continue
@@ -1061,7 +1125,18 @@ def engine_v2_cycle(
 
         with state_lock:
             open_setups = state.get("open_setups", {}).copy()
-        for setup_key, setup in open_setups.items():
+        symbol_setups = [(key, setup) for key, setup in open_setups.items() if setup.get("symbol") == symbol]
+        if not symbol_setups:
+            continue
+        live_price = get_live_price_if_needed(
+            exchange,
+            symbol,
+            base_data["closes"][-1],
+            has_active_setup=True,
+        )
+        if live_price is None:
+            continue
+        for setup_key, setup in symbol_setups:
             if setup.get("symbol") != symbol:
                 continue
             direction = setup["direction"]
@@ -1070,12 +1145,6 @@ def engine_v2_cycle(
                 last_entry_time = entry_memory.get(entry_key, 0)
             if allow_cooldown and time.time() - last_entry_time < COOLDOWN_MINUTES * 60:
                 continue
-            live_price = None
-            if ENGINE_V2_USE_LIVE_TRIGGER:
-                live_price = fetch_ticker_price(exchange, symbol)
-            if live_price is None:
-                live_price = base_data["closes"][-1]
-
             entry = check_trigger(setup, live_price, base_data, features)
             if not entry:
                 continue
@@ -1271,7 +1340,10 @@ def run_signal_cycle(
 
     def _fetch(symbol: str):
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=300)
+            # 15m TTL = 25s, 1h TTL = 600s (anti rate-limit, no behavior change)
+            ohlcv = fetch_ohlcv_raw_cached(exchange, symbol, TIMEFRAME, limit=300, ttl_seconds=25)
+            if not ohlcv:
+                return symbol, None, RuntimeError("empty ohlcv")
             df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             df.set_index("ts", inplace=True)
