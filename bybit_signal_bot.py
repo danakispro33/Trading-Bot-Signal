@@ -63,6 +63,7 @@ NEWS_SHOW_LIMIT = 10
 NEWS_SEEN_LIMIT = 2000
 NEWS_IMPORTANCE_THRESHOLD = 55
 NEWS_URGENT_THRESHOLD = 80
+NEWS_SLEEP_BUFFER_LIMIT = 50
 NEWS_PRICE_CHECK_ENABLED = True
 NEWS_PRICE_CHECK_MIN_IMPORTANCE = 65
 NEWS_PRICE_CHECK_COOLDOWN_SEC = 180
@@ -270,6 +271,11 @@ def now_inline_menu_keyboard() -> Dict:
 
 
 def news_inline_menu_keyboard(state: Dict) -> Dict:
+    sleep_enabled = bool(state.get("news_sleep", {}).get("enabled", False))
+    sleep_button = {
+        "text": "☀️ Проснулся" if sleep_enabled else "🌙 Спать",
+        "callback_data": "news:sleep_off" if sleep_enabled else "news:sleep_on",
+    }
     return {
         "inline_keyboard": [
             [{"text": "📰 Показать новости", "callback_data": "news:show"}],
@@ -282,6 +288,7 @@ def news_inline_menu_keyboard(state: Dict) -> Dict:
                 {"text": "📡 Источники", "callback_data": "news:sources"},
             ],
             [{"text": "🧪 Тест", "callback_data": "news:test"}],
+            [sleep_button],
             [
                 {"text": "⬅ Назад", "callback_data": "ui:back_now"},
                 {"text": "✖ Закрыть", "callback_data": "ui:close"},
@@ -1368,6 +1375,17 @@ def news_poll_once(
             if not news_item_passes_threshold(item, threshold):
                 continue
             if not item.url:
+                continue
+            with state_lock:
+                sleep_enabled = bool(state.get("news_sleep", {}).get("enabled", False))
+            if sleep_enabled:
+                with state_lock:
+                    buffer = list(state.get("news_sleep_buffer", []))
+                    buffer.append(news_item_to_dict(item))
+                    if len(buffer) > NEWS_SLEEP_BUFFER_LIMIT:
+                        buffer = buffer[-NEWS_SLEEP_BUFFER_LIMIT:]
+                    state["news_sleep_buffer"] = buffer
+                    save_state(state)
                 continue
             tg_send(format_news_card(item, state))
 
@@ -2690,6 +2708,78 @@ def command_loop(state: Dict) -> None:
                                 reply_markup=news_level_inline_menu_keyboard(current_level),
                             )
                         continue
+                    if data == "news:sleep_on":
+                        with state_lock:
+                            state.setdefault("news_sleep", {"enabled": False, "since_ts": None})
+                            state["news_sleep"]["enabled"] = True
+                            state["news_sleep"]["since_ts"] = int(time.time())
+                            state["news_sleep_buffer"] = []
+                            save_state(state)
+                        if message_id:
+                            tg_edit_message(
+                                "Хорошо. Я не буду отправлять новости, пока ты спишь.\n"
+                                "Я продолжу их собирать.",
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        else:
+                            tg_send(
+                                "Хорошо. Я не буду отправлять новости, пока ты спишь.\n"
+                                "Я продолжу их собирать.",
+                                chat_id=chat_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "news:sleep_off":
+                        with state_lock:
+                            state.setdefault("news_sleep", {"enabled": False, "since_ts": None})
+                            state["news_sleep"]["enabled"] = False
+                            state["news_sleep"]["since_ts"] = None
+                            save_state(state)
+                        tg_send(
+                            "Ты проснулся. Отправить новости, которые я нашёл за это время?",
+                            chat_id=chat_id,
+                            reply_markup={
+                                "inline_keyboard": [
+                                    [
+                                        {"text": "✅ Да", "callback_data": "news:sleep_send_yes"},
+                                        {"text": "❌ Нет", "callback_data": "news:sleep_send_no"},
+                                    ]
+                                ]
+                            },
+                        )
+                        if message_id:
+                            tg_edit_message(
+                                build_news_menu_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=news_inline_menu_keyboard(state),
+                            )
+                        continue
+                    if data == "news:sleep_send_yes":
+                        with state_lock:
+                            buffered_items = [
+                                news_item_from_dict(item)
+                                for item in state.get("news_sleep_buffer", [])
+                            ]
+                            state["news_sleep_buffer"] = []
+                            save_state(state)
+                        if not buffered_items:
+                            tg_send("За это время новых новостей не было.", chat_id=chat_id)
+                            continue
+                        for item in buffered_items:
+                            tg_send(format_news_card(item, state), chat_id=chat_id)
+                        continue
+                    if data == "news:sleep_send_no":
+                        with state_lock:
+                            state["news_sleep_buffer"] = []
+                            save_state(state)
+                        tg_send(
+                            "Хорошо. Новости, которые я нашёл, будут доступны некоторое время в разделе /news.",
+                            chat_id=chat_id,
+                        )
+                        continue
                     if data.startswith("news:level:"):
                         level_part = data.split(":", 2)[-1]
                         if level_part.isdigit():
@@ -2823,6 +2913,11 @@ def main() -> None:
             "sources": NEWS_SOURCES.copy(),
             "price_check": NEWS_PRICE_CHECK_ENABLED,
         })
+        state.setdefault("news_sleep", {
+            "enabled": False,
+            "since_ts": None,
+        })
+        state.setdefault("news_sleep_buffer", [])
         state.setdefault("news_translate_cache", {})
         state.setdefault("news_price_last_check", {})
         state.setdefault("news_last_poll_ts", 0)
