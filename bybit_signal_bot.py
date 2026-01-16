@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from typing import List, Dict, Optional, Tuple
 import math
 
@@ -49,7 +49,9 @@ MIN_CONFIDENCE = 62
 # News system config
 NEWS_ENABLED = True
 NEWS_POLL_SECONDS = 90
-NEWS_HTTP_TIMEOUT = 12
+NEWS_HTTP_TIMEOUT_RSS = (3, 6)
+NEWS_HTTP_TIMEOUT_API = (3, 8)
+NEWS_TEST_MAX_SECONDS = 12
 NEWS_MAX_ITEMS_PER_POLL = 50
 NEWS_STORE_LIMIT = 100
 NEWS_SHOW_LIMIT = 10
@@ -60,6 +62,7 @@ NEWS_PRICE_CHECK_ENABLED = True
 NEWS_PRICE_CHECK_MIN_IMPORTANCE = 65
 NEWS_PRICE_CHECK_COOLDOWN_SEC = 180
 NEWS_SOURCES = {"cryptopanic": True, "rss": True, "gdelt": False}
+NEWS_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CryptoNewsBot/1.0)"}
 
 CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")
 CRYPTOPANIC_ENDPOINT = "https://cryptopanic.com/api/v2/posts/"
@@ -917,7 +920,8 @@ def fetch_news_from_provider(provider_name: str, since_ts: int, limit: int) -> L
             response = requests.get(
                 CRYPTOPANIC_ENDPOINT,
                 params=params,
-                timeout=NEWS_HTTP_TIMEOUT,
+                headers=NEWS_HTTP_HEADERS,
+                timeout=NEWS_HTTP_TIMEOUT_API,
             )
             if response.status_code != 200:
                 return []
@@ -931,7 +935,11 @@ def fetch_news_from_provider(provider_name: str, since_ts: int, limit: int) -> L
         items: List[Dict] = []
         for feed_url in RSS_FEEDS:
             try:
-                response = requests.get(feed_url, timeout=NEWS_HTTP_TIMEOUT)
+                response = requests.get(
+                    feed_url,
+                    headers=NEWS_HTTP_HEADERS,
+                    timeout=NEWS_HTTP_TIMEOUT_RSS,
+                )
                 if response.status_code != 200:
                     continue
                 root = ET.fromstring(response.text)
@@ -965,6 +973,8 @@ def fetch_news_from_provider(provider_name: str, since_ts: int, limit: int) -> L
                 })
                 if len(items) >= limit:
                     break
+            if len(items) >= limit:
+                break
         return items
 
     if provider_name == "gdelt":
@@ -977,7 +987,8 @@ def fetch_news_from_provider(provider_name: str, since_ts: int, limit: int) -> L
             response = requests.get(
                 GDELT_DOC_ENDPOINT,
                 params=params,
-                timeout=NEWS_HTTP_TIMEOUT,
+                headers=NEWS_HTTP_HEADERS,
+                timeout=NEWS_HTTP_TIMEOUT_API,
             )
             if response.status_code != 200:
                 return []
@@ -1271,7 +1282,7 @@ def news_poll_once(
         preview = new_items[:3]
         if not preview:
             tg_send(
-                "📰 TEST NEWS\n"
+                "🧪 TEST NEWS\n"
                 "━━━━━━━━━━━━━━━━\n"
                 "Нет свежих новостей\n"
                 "━━━━━━━━━━━━━━━━",
@@ -1295,30 +1306,118 @@ def news_worker(exchange: ccxt.bybit, state: Dict) -> None:
         time.sleep(NEWS_POLL_SECONDS)
 
 
-def _news_test_worker(chat_id: int, state: Dict) -> None:
+def _send_news_test_timeout(chat_id: int) -> None:
+    tg_send(
+        "🧪 TEST NEWS\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "⚠️ Таймаут: часть источников не ответила\n"
+        "━━━━━━━━━━━━━━━━",
+        chat_id=chat_id,
+    )
+
+
+def run_news_test_job(chat_id: int, state: Dict) -> None:
+    start_ts = time.time()
     try:
-        news_poll_once(
-            exchange=None,
-            state=state,
-            publish=False,
-            chat_id=chat_id,
-            test_mode=True,
-            update_last_poll=False,
-        )
+        with state_lock:
+            settings = dict(state.get("news_settings", {}))
+            sources = dict(settings.get("sources") or NEWS_SOURCES)
+
+        providers = [provider for provider in ("cryptopanic", "rss", "gdelt") if sources.get(provider)]
+        if not providers:
+            tg_send(
+                "🧪 TEST NEWS\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "Нет активных источников\n"
+                "━━━━━━━━━━━━━━━━",
+                chat_id=chat_id,
+            )
+            return
+
+        since_ts = int(time.time()) - 3600
+        raw_all: List[NewsItem] = []
+        provider_timeout = {
+            "cryptopanic": NEWS_HTTP_TIMEOUT_API[1],
+            "gdelt": NEWS_HTTP_TIMEOUT_API[1],
+            "rss": NEWS_HTTP_TIMEOUT_RSS[1],
+        }
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                provider: executor.submit(fetch_news_from_provider, provider, since_ts, NEWS_MAX_ITEMS_PER_POLL)
+                for provider in providers
+            }
+            for provider, future in futures.items():
+                remaining = NEWS_TEST_MAX_SECONDS - (time.time() - start_ts)
+                if remaining <= 0:
+                    _send_news_test_timeout(chat_id)
+                    return
+                timeout = min(remaining, provider_timeout.get(provider, remaining))
+                try:
+                    raw_items = future.result(timeout=timeout)
+                except TimeoutError:
+                    future.cancel()
+                    continue
+                except Exception:
+                    continue
+                raw_all.extend(parse_provider_items(provider, raw_items, since_ts))
+                if time.time() - start_ts > NEWS_TEST_MAX_SECONDS:
+                    _send_news_test_timeout(chat_id)
+                    return
+
+        if time.time() - start_ts > NEWS_TEST_MAX_SECONDS:
+            _send_news_test_timeout(chat_id)
+            return
+
+        if not raw_all:
+            tg_send(
+                "🧪 TEST NEWS\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "Нет свежих новостей\n"
+                "━━━━━━━━━━━━━━━━",
+                chat_id=chat_id,
+            )
+            return
+
+        title_count: Dict[str, int] = {}
+        source_by_title: Dict[str, set] = {}
+        for item in raw_all:
+            title_hash = item.raw.get("title_hash", "")
+            if not title_hash:
+                continue
+            title_count[title_hash] = title_count.get(title_hash, 0) + 1
+            source_by_title.setdefault(title_hash, set()).add(item.provider)
+
+        for item in raw_all:
+            canonical_url = item.raw.get("canonical_url", "")
+            title_hash = item.raw.get("title_hash", "")
+            repeated_count = title_count.get(title_hash, 1)
+            has_multiple_sources = len(source_by_title.get(title_hash, set())) > 1
+            item.credibility = score_credibility(item.provider, repeated_count, has_multiple_sources, canonical_url)
+            item.importance = compute_importance(item, repeated_count, has_multiple_sources)
+            item.urgency = compute_urgency(item, repeated_count)
+
+        raw_all.sort(key=lambda item: item.published_ts, reverse=True)
+        preview = raw_all[:3]
+        for item in preview:
+            if time.time() - start_ts > NEWS_TEST_MAX_SECONDS:
+                _send_news_test_timeout(chat_id)
+                return
+            tg_send(format_news_card(item), chat_id=chat_id)
     except Exception as e:
         print(f"[NEWS TEST ERROR] {type(e).__name__}: {e}")
-        tg_send("📰 TEST NEWS: ошибка при выполнении", chat_id=chat_id)
+        tg_send("🧪 TEST NEWS: ошибка при выполнении", chat_id=chat_id)
 
 
 def run_news_test(chat_id: int, state: Dict) -> None:
     tg_send(
-        "📰 TEST NEWS\n"
+        "🧪 TEST NEWS\n"
         "━━━━━━━━━━━━━━━━\n"
         "⏳ Проверяю источники…\n"
         "━━━━━━━━━━━━━━━━",
         chat_id=chat_id,
     )
-    threading.Thread(target=_news_test_worker, args=(chat_id, state), daemon=True).start()
+    threading.Thread(target=run_news_test_job, args=(chat_id, state), daemon=True).start()
 
 
 # ================== INDICATORS ==================
