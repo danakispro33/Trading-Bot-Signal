@@ -2,6 +2,13 @@ import time
 import json
 import threading
 import os
+import re
+import hashlib
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
 import math
@@ -38,6 +45,29 @@ TIMEFRAME = "15m"
 CHECK_EVERY_SECONDS = 60
 COOLDOWN_MINUTES = 90
 MIN_CONFIDENCE = 62
+
+# News system config
+NEWS_ENABLED = True
+NEWS_POLL_SECONDS = 90
+NEWS_HTTP_TIMEOUT = 12
+NEWS_MAX_ITEMS_PER_POLL = 50
+NEWS_STORE_LIMIT = 100
+NEWS_SHOW_LIMIT = 10
+NEWS_SEEN_LIMIT = 2000
+NEWS_IMPORTANCE_THRESHOLD = 55
+NEWS_URGENT_THRESHOLD = 80
+NEWS_PRICE_CHECK_ENABLED = True
+NEWS_PRICE_CHECK_MIN_IMPORTANCE = 65
+NEWS_PRICE_CHECK_COOLDOWN_SEC = 180
+NEWS_SOURCES = {"cryptopanic": True, "rss": True, "gdelt": False}
+
+CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")
+CRYPTOPANIC_ENDPOINT = "https://cryptopanic.com/api/v2/posts/"
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://cointelegraph.com/rss",
+]
+GDELT_DOC_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 # Engine v2 config
 ENGINE_V2_ENABLED = True
@@ -189,6 +219,13 @@ def build_help_text() -> str:
         "⚙️ SetConfidence\n"
         "⏯ Старт / Пауза\n"
         "⚡ Сейчас\n"
+        "📰 /news\n"
+        "📰 /news_on\n"
+        "📰 /news_off\n"
+        "📰 /news_level\n"
+        "📰 /news_sources\n"
+        "📰 /news_source\n"
+        "📰 /news_test\n"
         "━━━━━━━━━━━━"
     )
 
@@ -373,6 +410,112 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         )
         return
 
+    if command == "/news":
+        send_recent_news(chat_id, state)
+        return
+
+    if command == "/news_on":
+        with state_lock:
+            settings = state.setdefault("news_settings", {})
+            settings["enabled"] = True
+            save_state(state)
+        tg_send(
+            "📰 НОВОСТИ ВКЛЮЧЕНЫ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "✅ Автопубликация активна\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/news_off":
+        with state_lock:
+            settings = state.setdefault("news_settings", {})
+            settings["enabled"] = False
+            save_state(state)
+        tg_send(
+            "📰 НОВОСТИ ОТКЛЮЧЕНЫ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "⏸ Автопубликация остановлена\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/news_level":
+        if len(parts) == 2 and parts[1].isdigit():
+            value = int(parts[1])
+            if 0 <= value <= 100:
+                with state_lock:
+                    settings = state.setdefault("news_settings", {})
+                    settings["importance_threshold"] = value
+                    save_state(state)
+                tg_send(
+                    "📰 ПОРОГ ВАЖНОСТИ\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    f"🔥 Новый порог: {value}/100\n"
+                    "━━━━━━━━━━━━━━━━",
+                    chat_id=chat_id,
+                )
+                return
+        with state_lock:
+            settings = state.get("news_settings", {})
+            current = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+        tg_send(
+            "📰 ПОРОГ ВАЖНОСТИ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"🔥 Текущий порог: {current}/100\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/news_sources":
+        with state_lock:
+            settings = state.get("news_settings", {})
+            sources = settings.get("sources") or NEWS_SOURCES
+        lines = [
+            "📰 ИСТОЧНИКИ НОВОСТЕЙ",
+            "━━━━━━━━━━━━━━━━",
+            f"cryptopanic: {'on' if sources.get('cryptopanic') else 'off'}",
+            f"rss: {'on' if sources.get('rss') else 'off'}",
+            f"gdelt: {'on' if sources.get('gdelt') else 'off'}",
+            "━━━━━━━━━━━━━━━━",
+        ]
+        tg_send("\n".join(lines), chat_id=chat_id)
+        return
+
+    if command == "/news_source":
+        if len(parts) == 3:
+            source_name = parts[1].lower()
+            action = parts[2].lower()
+            if source_name in NEWS_SOURCES and action in {"on", "off"}:
+                with state_lock:
+                    settings = state.setdefault("news_settings", {})
+                    sources = settings.setdefault("sources", NEWS_SOURCES.copy())
+                    sources[source_name] = action == "on"
+                    save_state(state)
+                tg_send(
+                    "📰 ИСТОЧНИКИ НОВОСТЕЙ\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    f"{source_name}: {'on' if action == 'on' else 'off'}\n"
+                    "━━━━━━━━━━━━━━━━",
+                    chat_id=chat_id,
+                )
+                return
+        tg_send(
+            "📰 ИСТОЧНИКИ НОВОСТЕЙ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "Формат: /news_source <cryptopanic|rss|gdelt> <on|off>\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
+
+    if command == "/news_test":
+        run_news_test(chat_id, state)
+        return
+
     if command == "/setconfidence":
         if len(parts) == 2 and parts[1].isdigit():
             value = int(parts[1])
@@ -457,6 +600,632 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             chat_id=chat_id,
         )
         return
+
+
+# ================= NEWS SYSTEM =================
+@dataclass
+class NewsItem:
+    provider: str
+    provider_id: str
+    title: str
+    url: str
+    published_ts: int
+    raw: Dict
+    coins: List[str]
+    category: str
+    importance: int
+    urgency: int
+    credibility: int
+    price_move: Optional[str]
+    canonical_key: str
+
+
+NEWS_TEXT_MAX_LEN = 180
+NEWS_CLEAN_QUERY_KEYS = {
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "utm_name",
+    "utm_referrer",
+    "ref",
+    "ref_src",
+}
+NEWS_SUSPICIOUS_DOMAINS = {"t.me", "twitter.com", "x.com"}
+
+COIN_TICKERS = [
+    "BTC", "ETH", "XRP", "SOL", "BNB", "ADA", "DOGE", "TRX", "DOT", "AVAX",
+    "LINK", "MATIC", "LTC", "BCH", "XLM", "ATOM", "ETC", "APT", "ARB", "OP",
+    "NEAR", "FIL", "ICP", "SUI", "INJ", "AAVE", "UNI", "RUNE", "ALGO", "EGLD",
+    "FTM", "KAVA", "HBAR", "XTZ", "FLOW", "GRT", "SNX", "MKR", "DYDX", "IMX",
+]
+COIN_ALIASES = {
+    "bitcoin": "BTC",
+    "btc": "BTC",
+    "ethereum": "ETH",
+    "ether": "ETH",
+    "eth": "ETH",
+    "ripple": "XRP",
+    "xrp": "XRP",
+    "solana": "SOL",
+    "cardano": "ADA",
+    "dogecoin": "DOGE",
+    "polkadot": "DOT",
+    "avalanche": "AVAX",
+    "chainlink": "LINK",
+    "polygon": "MATIC",
+    "litecoin": "LTC",
+    "bitcoin cash": "BCH",
+    "stellar": "XLM",
+    "cosmos": "ATOM",
+    "ethereum classic": "ETC",
+}
+COIN_PATTERN = re.compile(r"\b(" + "|".join(COIN_TICKERS) + r")\b", re.IGNORECASE)
+DOLLAR_TICKER_PATTERN = re.compile(r"\$([A-Z]{2,6})\b")
+
+
+def safe_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > NEWS_TEXT_MAX_LEN:
+        text = text[:NEWS_TEXT_MAX_LEN - 1] + "…"
+    return text
+
+
+def normalize_url(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url.strip()
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc.lower()
+    path = parsed.path or ""
+    query_items = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if k.lower() not in NEWS_CLEAN_QUERY_KEYS and not k.lower().startswith("utm_")
+    ]
+    query = urlencode(query_items)
+    cleaned = urlunparse((scheme, netloc, path, "", query, ""))
+    return cleaned.rstrip("/")
+
+
+def normalize_title(title: str) -> str:
+    return re.sub(r"\s+", " ", (title or "").strip().lower())
+
+
+def to_epoch(value: Optional[str]) -> int:
+    if value is None:
+        return int(time.time())
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return int(time.time())
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        try:
+            dt = parsedate_to_datetime(text)
+        except Exception:
+            return int(time.time())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def make_canonical_key(provider: str, provider_id: str, canonical_url: str, title: str) -> str:
+    raw_key = f"{provider}|{provider_id}|{canonical_url}|{title}"
+    return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
+
+
+def build_cross_source_key(canonical_url: str, title_hash: str) -> str:
+    raw_key = f"{canonical_url}|{title_hash}"
+    return hashlib.sha1(raw_key.encode("utf-8")).hexdigest()
+
+
+def extract_coins(title: str, text_optional: Optional[str] = None) -> List[str]:
+    content = f"{title} {text_optional or ''}".strip()
+    coins: List[str] = []
+    for ticker in DOLLAR_TICKER_PATTERN.findall(content):
+        t = ticker.upper()
+        if t in COIN_TICKERS and t not in coins:
+            coins.append(t)
+    for ticker in COIN_PATTERN.findall(content):
+        t = ticker.upper()
+        if t not in coins:
+            coins.append(t)
+    lowered = content.lower()
+    for alias, ticker in COIN_ALIASES.items():
+        if alias in lowered and ticker not in coins:
+            coins.append(ticker)
+    return coins[:3]
+
+
+def classify_category(title: str, text_optional: Optional[str] = None) -> str:
+    content = f"{title} {text_optional or ''}".lower()
+    if any(word in content for word in ["hack", "exploit", "breach", "drain", "attack"]):
+        return "security"
+    if any(word in content for word in ["sec", "lawsuit", "regulation", "ban", "compliance"]):
+        return "regulation"
+    if any(word in content for word in ["listing", "delisting", "exchange", "airdrop"]):
+        return "exchange"
+    if any(word in content for word in ["etf", "blackrock", "approval", "fed", "cpi", "macro"]):
+        return "macro"
+    return "market"
+
+
+def score_credibility(provider: str, repeated_count: int, has_multiple_sources: bool, url: str) -> int:
+    base = 70 if provider == "cryptopanic" else 55 if provider == "rss" else 50
+    if repeated_count > 1:
+        base += 10
+    if has_multiple_sources:
+        base += 10
+    domain = urlparse(url).netloc.lower() if url else ""
+    if domain in NEWS_SUSPICIOUS_DOMAINS:
+        base -= 15
+    return max(0, min(100, base))
+
+
+def compute_importance(item: NewsItem, repeated_count: int, has_multiple_sources: bool) -> int:
+    score = 35
+    if item.category in {"security", "regulation", "macro"}:
+        score += 20
+    if any(coin in {"BTC", "ETH"} for coin in item.coins):
+        score += 5
+    if repeated_count > 1:
+        score += 10
+    if has_multiple_sources:
+        score += 10
+    title = item.title.lower()
+    if any(word in title for word in ["breaking", "urgent", "just in"]):
+        score += 10
+    return max(0, min(100, score))
+
+
+def compute_urgency(item: NewsItem, repeated_count: int) -> int:
+    score = 30
+    title = item.title.lower()
+    if any(word in title for word in ["breaking", "urgent", "just in"]):
+        score += 15
+    if item.category in {"security", "regulation"}:
+        score += 10
+    if repeated_count > 1:
+        score += 5
+    return max(0, min(100, score))
+
+
+def get_price_change_1h(exchange: ccxt.bybit, symbol: str) -> Optional[str]:
+    parsed = fetch_ohlcv_cached(exchange, symbol, "1h", limit=2, ttl_seconds=120)
+    if not parsed:
+        return None
+    closes = parsed[2]
+    if len(closes) < 2 or closes[-2] == 0:
+        return None
+    pct = (closes[-1] - closes[-2]) / closes[-2] * 100
+    return f"{pct:+.2f}%"
+
+
+def fetch_news_from_provider(provider_name: str, since_ts: int, limit: int) -> List[Dict]:
+    if provider_name == "cryptopanic":
+        params = {"kind": "news"}
+        if CRYPTOPANIC_TOKEN:
+            params["auth_token"] = CRYPTOPANIC_TOKEN
+        else:
+            params["public"] = "true"
+        try:
+            response = requests.get(
+                CRYPTOPANIC_ENDPOINT,
+                params=params,
+                timeout=NEWS_HTTP_TIMEOUT,
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            results = data.get("results", [])
+            return results[:limit]
+        except Exception:
+            return []
+
+    if provider_name == "rss":
+        items: List[Dict] = []
+        for feed_url in RSS_FEEDS:
+            try:
+                response = requests.get(feed_url, timeout=NEWS_HTTP_TIMEOUT)
+                if response.status_code != 200:
+                    continue
+                root = ET.fromstring(response.text)
+            except Exception:
+                continue
+            feed_name = urlparse(feed_url).netloc or "rss"
+            for item in root.findall(".//item"):
+                title = item.findtext("title") or ""
+                link = item.findtext("link") or ""
+                pub_date = item.findtext("pubDate") or item.findtext("published") or ""
+                items.append({
+                    "feed": feed_name,
+                    "title": title,
+                    "link": link,
+                    "published": pub_date,
+                })
+                if len(items) >= limit:
+                    break
+            if len(items) >= limit:
+                break
+            for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry"):
+                title = entry.findtext("{http://www.w3.org/2005/Atom}title") or ""
+                link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                link = link_el.get("href") if link_el is not None else ""
+                pub_date = entry.findtext("{http://www.w3.org/2005/Atom}published") or ""
+                items.append({
+                    "feed": feed_name,
+                    "title": title,
+                    "link": link,
+                    "published": pub_date,
+                })
+                if len(items) >= limit:
+                    break
+        return items
+
+    if provider_name == "gdelt":
+        params = {
+            "query": "cryptocurrency OR bitcoin OR ethereum OR xrp",
+            "mode": "ArtList",
+            "format": "json",
+        }
+        try:
+            response = requests.get(
+                GDELT_DOC_ENDPOINT,
+                params=params,
+                timeout=NEWS_HTTP_TIMEOUT,
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            results = data.get("articles", [])
+            return results[:limit]
+        except Exception:
+            return []
+
+    return []
+
+
+def parse_provider_items(provider_name: str, raw_items: List[Dict], since_ts: int) -> List[NewsItem]:
+    parsed_items: List[NewsItem] = []
+    for raw in raw_items:
+        if provider_name == "cryptopanic":
+            provider_id = str(raw.get("id", ""))
+            title = safe_text(raw.get("title"))
+            url = raw.get("url") or ""
+            published_ts = to_epoch(raw.get("published_at"))
+        elif provider_name == "rss":
+            provider_id = hashlib.sha1((raw.get("link") or raw.get("title") or "").encode("utf-8")).hexdigest()
+            title = safe_text(raw.get("title"))
+            url = raw.get("link") or ""
+            published_ts = to_epoch(raw.get("published"))
+        else:
+            provider_id = hashlib.sha1((raw.get("url") or raw.get("title") or "").encode("utf-8")).hexdigest()
+            title = safe_text(raw.get("title"))
+            url = raw.get("url") or ""
+            published_ts = to_epoch(raw.get("seendate") or raw.get("published"))
+
+        if not title:
+            continue
+        if published_ts < since_ts:
+            continue
+
+        canonical_url = normalize_url(url)
+        normalized_title = normalize_title(title)
+        title_hash = hashlib.sha1(normalized_title.encode("utf-8")).hexdigest()
+        canonical_key = make_canonical_key(provider_name, provider_id, canonical_url, normalized_title)
+        coins = extract_coins(title)
+        category = classify_category(title)
+        raw_payload = dict(raw)
+        raw_payload.update({
+            "canonical_url": canonical_url,
+            "normalized_title": normalized_title,
+            "title_hash": title_hash,
+        })
+        parsed_items.append(NewsItem(
+            provider=provider_name,
+            provider_id=provider_id,
+            title=title,
+            url=url,
+            published_ts=published_ts,
+            raw=raw_payload,
+            coins=coins,
+            category=category,
+            importance=0,
+            urgency=0,
+            credibility=0,
+            price_move=None,
+            canonical_key=canonical_key,
+        ))
+    return parsed_items
+
+
+def news_item_to_dict(item: NewsItem) -> Dict:
+    return {
+        "provider": item.provider,
+        "provider_id": item.provider_id,
+        "title": item.title,
+        "url": item.url,
+        "published_ts": item.published_ts,
+        "raw": item.raw,
+        "coins": item.coins,
+        "category": item.category,
+        "importance": item.importance,
+        "urgency": item.urgency,
+        "credibility": item.credibility,
+        "price_move": item.price_move,
+        "canonical_key": item.canonical_key,
+    }
+
+
+def news_item_from_dict(data: Dict) -> NewsItem:
+    return NewsItem(
+        provider=data.get("provider", ""),
+        provider_id=data.get("provider_id", ""),
+        title=data.get("title", ""),
+        url=data.get("url", ""),
+        published_ts=int(data.get("published_ts", 0)),
+        raw=data.get("raw", {}),
+        coins=data.get("coins", []) or [],
+        category=data.get("category", "market"),
+        importance=int(data.get("importance", 0)),
+        urgency=int(data.get("urgency", 0)),
+        credibility=int(data.get("credibility", 0)),
+        price_move=data.get("price_move"),
+        canonical_key=data.get("canonical_key", ""),
+    )
+
+
+def format_news_card(item: NewsItem) -> str:
+    coins = ", ".join(item.coins) if item.coins else "—"
+    url = item.url or "—"
+    if item.urgency >= NEWS_URGENT_THRESHOLD:
+        price_line = f"📈 {item.price_move}" if item.price_move else ""
+        return (
+            "🚨 Срочно\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"🪙 {coins}\n"
+            f"🏷 {item.category}\n"
+            f"🔥 {item.importance}/100  ⏱ {item.urgency}/100\n"
+            f"{price_line}\n"
+            f"🧠 {item.title}\n"
+            f"🔗 {url}\n"
+            "━━━━━━━━━━━━━━━━"
+        ).replace("\n\n", "\n")
+    return (
+        "📰 Новость\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🪙 {coins}\n"
+        f"🏷 {item.category}\n"
+        f"🔥 {item.importance}/100\n"
+        f"🧠 {item.title}\n"
+        f"🔗 {url}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def send_recent_news(chat_id: int, state: Dict) -> None:
+    with state_lock:
+        items_raw = list(state.get("news", []))
+    if not items_raw:
+        tg_send(
+            "📰 НОВОСТИ\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "Пока нет новостей\n"
+            "━━━━━━━━━━━━━━━━",
+            chat_id=chat_id,
+        )
+        return
+    limit = min(len(items_raw), NEWS_SHOW_LIMIT)
+    items = [news_item_from_dict(item) for item in items_raw[-limit:]]
+    items.reverse()
+    chunks: List[str] = []
+    current = ""
+    for item in items:
+        card = format_news_card(item)
+        if len(current) + len(card) + 2 > 3500:
+            if current:
+                chunks.append(current)
+            current = card
+        else:
+            current = f"{current}\n\n{card}" if current else card
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        tg_send(chunk, chat_id=chat_id)
+
+
+def prune_news_list(news_list: List[Dict]) -> List[Dict]:
+    if len(news_list) <= NEWS_STORE_LIMIT:
+        return news_list
+    return news_list[-NEWS_STORE_LIMIT:]
+
+
+def prune_news_seen(news_seen: Dict[str, int]) -> None:
+    if len(news_seen) <= NEWS_SEEN_LIMIT:
+        return
+    sorted_items = sorted(news_seen.items(), key=lambda item: item[1])
+    remove_count = max(1, int(len(sorted_items) * 0.2))
+    for key, _ in sorted_items[:remove_count]:
+        news_seen.pop(key, None)
+
+
+def news_poll_once(
+    exchange: Optional[ccxt.bybit],
+    state: Dict,
+    publish: bool = True,
+    chat_id: Optional[int] = None,
+    test_mode: bool = False,
+    update_last_poll: bool = True,
+) -> List[NewsItem]:
+    with state_lock:
+        settings = dict(state.get("news_settings", {}))
+        enabled = settings.get("enabled", NEWS_ENABLED)
+        sources = dict(settings.get("sources") or NEWS_SOURCES)
+        threshold = settings.get("importance_threshold", NEWS_IMPORTANCE_THRESHOLD)
+        price_check_enabled = settings.get("price_check", NEWS_PRICE_CHECK_ENABLED)
+        news_seen = dict(state.get("news_seen", {}))
+        news_list = list(state.get("news", []))
+        price_last_check = dict(state.get("news_price_last_check", {}))
+        last_poll_ts = int(state.get("news_last_poll_ts", 0))
+
+    if not enabled and not test_mode:
+        return []
+
+    since_ts = max(last_poll_ts - 3600, 0)
+    now_ts = int(time.time())
+    raw_all: List[NewsItem] = []
+    providers = ["cryptopanic", "rss", "gdelt"]
+    for provider in providers:
+        if not sources.get(provider):
+            continue
+        raw_items = fetch_news_from_provider(provider, since_ts, NEWS_MAX_ITEMS_PER_POLL)
+        parsed_items = parse_provider_items(provider, raw_items, since_ts)
+        raw_all.extend(parsed_items)
+
+    if not raw_all:
+        if update_last_poll:
+            with state_lock:
+                state["news_last_poll_ts"] = now_ts
+                save_state(state)
+        return []
+
+    title_count: Dict[str, int] = {}
+    source_by_title: Dict[str, set] = {}
+    for item in raw_all:
+        title_hash = item.raw.get("title_hash", "")
+        if not title_hash:
+            continue
+        title_count[title_hash] = title_count.get(title_hash, 0) + 1
+        source_by_title.setdefault(title_hash, set()).add(item.provider)
+
+    symbol_map = {normalize_symbol(symbol): symbol for symbol in SYMBOLS}
+    new_items: List[NewsItem] = []
+
+    for item in raw_all:
+        canonical_url = item.raw.get("canonical_url", "")
+        title_hash = item.raw.get("title_hash", "")
+        cross_key = build_cross_source_key(canonical_url, title_hash)
+        if item.canonical_key in news_seen or cross_key in news_seen:
+            continue
+
+        repeated_count = title_count.get(title_hash, 1)
+        has_multiple_sources = len(source_by_title.get(title_hash, set())) > 1
+        item.credibility = score_credibility(item.provider, repeated_count, has_multiple_sources, canonical_url)
+        item.importance = compute_importance(item, repeated_count, has_multiple_sources)
+        item.urgency = compute_urgency(item, repeated_count)
+
+        if (
+            price_check_enabled
+            and exchange is not None
+            and len(item.coins) == 1
+            and item.importance >= NEWS_PRICE_CHECK_MIN_IMPORTANCE
+        ):
+            coin = item.coins[0]
+            last_check = int(price_last_check.get(coin, 0))
+            if now_ts - last_check >= NEWS_PRICE_CHECK_COOLDOWN_SEC:
+                symbol = symbol_map.get(coin)
+                if symbol:
+                    try:
+                        price_move = get_price_change_1h(exchange, symbol)
+                    except Exception:
+                        price_move = None
+                    item.price_move = price_move
+                    price_last_check[coin] = now_ts
+
+        news_seen[item.canonical_key] = now_ts
+        news_seen[cross_key] = now_ts
+        new_items.append(item)
+        news_list.append(news_item_to_dict(item))
+
+    if not new_items:
+        return []
+
+    news_list = prune_news_list(news_list)
+    prune_news_seen(news_seen)
+
+    if update_last_poll:
+        last_poll_ts = now_ts
+
+    with state_lock:
+        state["news"] = news_list
+        state["news_seen"] = news_seen
+        state["news_price_last_check"] = price_last_check
+        if update_last_poll:
+            state["news_last_poll_ts"] = last_poll_ts
+        save_state(state)
+
+    if publish:
+        for item in new_items:
+            if item.importance < threshold:
+                continue
+            if not item.url:
+                continue
+            tg_send(format_news_card(item))
+
+    if test_mode and chat_id is not None:
+        preview = new_items[:3]
+        if not preview:
+            tg_send(
+                "📰 TEST NEWS\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "Нет свежих новостей\n"
+                "━━━━━━━━━━━━━━━━",
+                chat_id=chat_id,
+            )
+        else:
+            for item in preview:
+                tg_send(format_news_card(item), chat_id=chat_id)
+
+    print(f"[NEWS] fetched {len(raw_all)} items, new {len(new_items)}")
+    return new_items
+
+
+def news_worker(exchange: ccxt.bybit, state: Dict) -> None:
+    print("News worker started")
+    while True:
+        try:
+            news_poll_once(exchange, state, publish=True, update_last_poll=True)
+        except Exception as e:
+            print(f"[NEWS ERROR] {type(e).__name__}: {e}")
+        time.sleep(NEWS_POLL_SECONDS)
+
+
+def _news_test_worker(chat_id: int, state: Dict) -> None:
+    try:
+        news_poll_once(
+            exchange=None,
+            state=state,
+            publish=False,
+            chat_id=chat_id,
+            test_mode=True,
+            update_last_poll=False,
+        )
+    except Exception as e:
+        print(f"[NEWS TEST ERROR] {type(e).__name__}: {e}")
+        tg_send("📰 TEST NEWS: ошибка при выполнении", chat_id=chat_id)
+
+
+def run_news_test(chat_id: int, state: Dict) -> None:
+    tg_send(
+        "📰 TEST NEWS\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "⏳ Проверяю источники…\n"
+        "━━━━━━━━━━━━━━━━",
+        chat_id=chat_id,
+    )
+    threading.Thread(target=_news_test_worker, args=(chat_id, state), daemon=True).start()
 
 
 # ================== INDICATORS ==================
@@ -1629,6 +2398,16 @@ def main() -> None:
         state.setdefault("entry_memory", {})
         state.setdefault("open_setups", {})
         state.setdefault("engine_config_version", 1)
+        state.setdefault("news", [])
+        state.setdefault("news_seen", {})
+        state.setdefault("news_settings", {
+            "enabled": NEWS_ENABLED,
+            "importance_threshold": NEWS_IMPORTANCE_THRESHOLD,
+            "sources": NEWS_SOURCES.copy(),
+            "price_check": NEWS_PRICE_CHECK_ENABLED,
+        })
+        state.setdefault("news_price_last_check", {})
+        state.setdefault("news_last_poll_ts", 0)
         try:
             MIN_CONFIDENCE = int(state.get("min_confidence", default_confidence))
         except (TypeError, ValueError):
@@ -1648,6 +2427,12 @@ def main() -> None:
         f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
         f"🛡 Антиспам: {COOLDOWN_MINUTES} мин"
     )
+
+    with state_lock:
+        news_enabled = state.get("news_settings", {}).get("enabled", NEWS_ENABLED)
+    if news_enabled:
+        news_thread = threading.Thread(target=news_worker, args=(exchange, state), daemon=True)
+        news_thread.start()
 
     command_thread = threading.Thread(target=command_loop, args=(state,), daemon=True)
     signal_thread = threading.Thread(target=signal_loop, args=(exchange, state), daemon=True)
