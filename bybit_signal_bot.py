@@ -40,7 +40,7 @@ ALL_SYMBOLS = [
     "AVAXUSDT",
     "LINKUSDT",
     "TONUSDT",
-    "MATICUSDT",
+    "INJUSDT",
     "LTCUSDT",
     "BCHUSDT",
     "XLMUSDT",
@@ -595,6 +595,7 @@ def ensure_settings(state: Dict) -> Dict:
     coins = settings.setdefault("coins", {symbol: True for symbol in ALL_SYMBOLS})
     for symbol in ALL_SYMBOLS:
         coins.setdefault(symbol, True)
+    coins = {key: value for key, value in coins.items() if key in set(ALL_SYMBOLS)}
     settings["coins"] = coins
     state["min_confidence"] = settings["min_confidence"]
     return settings
