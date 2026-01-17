@@ -148,6 +148,8 @@ state_lock = threading.Lock()
 run_now_request = {"chat_id": None}
 _OHLCV_CACHE: Dict[Tuple[str, str], Dict[str, object]] = {}
 _LAST_RL_LOG_TS = 0.0
+MANUAL_MARKETS_CACHE_TTL = 600
+MANUAL_SYMBOL_QUOTE = "USDT"
 
 
 # ============================================================
@@ -359,7 +361,7 @@ def main_keyboard() -> Dict:
             [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
             [{"text": "📌 Сигналы"}, {"text": "🎯 Confidence"}],
             [{"text": "⚙️ Настройки"}, {"text": "⏯ Старт / Пауза"}],
-            [{"text": "ℹ️ Помощь"}],
+            [{"text": "🔍 Анализ"}, {"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -385,6 +387,7 @@ def build_help_text() -> str:
         "📰 /news_sources\n"
         "📰 /news_source\n"
         "📰 /news_test\n"
+        "🔍 /analyze\n"
         "━━━━━━━━━━━━"
     )
 
@@ -405,6 +408,9 @@ def help_inline_keyboard() -> Dict:
             ],
             [
                 {"text": "⏯ Старт / Пауза", "callback_data": "cmd:toggle"},
+            ],
+            [
+                {"text": "🔍 Анализ", "callback_data": "menu_analyze"},
             ],
         ]
     }
@@ -503,7 +509,7 @@ def build_news_level_text(current_level: int) -> str:
 
 def build_settings_text(state: Dict) -> str:
     settings = get_settings_snapshot(state)
-    enabled_count = len([coin for coin, enabled in settings["coins"].items() if enabled])
+    enabled_count = get_combined_symbol_count(state)
     return (
         "⚙️ Настройки\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -531,7 +537,7 @@ def settings_inline_keyboard() -> Dict:
 
 def build_settings_coins_text(state: Dict) -> str:
     settings = get_settings_snapshot(state)
-    enabled_count = len([coin for coin, enabled in settings["coins"].items() if enabled])
+    enabled_count = get_combined_symbol_count(state)
     return (
         "⚙️ Настройки → Монеты\n"
         "━━━━━━━━━━━━━━━━\n"
@@ -619,6 +625,61 @@ def get_enabled_symbol_codes(state: Dict) -> List[str]:
 
 def get_enabled_symbols(state: Dict) -> List[str]:
     return [to_ccxt_symbol(symbol) for symbol in get_enabled_symbol_codes(state)]
+
+
+def ensure_manual_watchlist(state: Dict) -> Dict:
+    state.setdefault("manual_watchlist", [])
+    state.setdefault("manual_watchlist_enabled", True)
+    state.setdefault("manual_watchlist_limit", None)
+    state.setdefault("manual_analysis", {
+        "awaiting_symbol": False,
+        "pending_symbol": None,
+        "pending_remove": None,
+    })
+    return state
+
+
+def get_manual_watchlist(state: Dict) -> List[str]:
+    with state_lock:
+        ensure_manual_watchlist(state)
+        if not state.get("manual_watchlist_enabled", True):
+            return []
+        return list(state.get("manual_watchlist", []))
+
+
+def to_ccxt_manual_symbol(symbol: str) -> str:
+    cleaned = (symbol or "").strip().upper()
+    if not cleaned:
+        return cleaned
+    if ":" in cleaned:
+        return cleaned
+    if "/" in cleaned:
+        base, quote = cleaned.split("/", 1)
+        if quote == MANUAL_SYMBOL_QUOTE:
+            return f"{base}/{quote}:{quote}"
+        return f"{base}/{quote}"
+    if cleaned.endswith(MANUAL_SYMBOL_QUOTE):
+        base = cleaned[:-len(MANUAL_SYMBOL_QUOTE)]
+        return f"{base}/{MANUAL_SYMBOL_QUOTE}:{MANUAL_SYMBOL_QUOTE}"
+    return cleaned
+
+
+def get_combined_symbols(state: Dict) -> List[str]:
+    base_symbols = get_enabled_symbols(state)
+    manual_symbols = [to_ccxt_manual_symbol(symbol) for symbol in get_manual_watchlist(state)]
+    combined: List[str] = []
+    seen = set()
+    for symbol in base_symbols + manual_symbols:
+        key = symbol.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(symbol)
+    return combined
+
+
+def get_combined_symbol_count(state: Dict) -> int:
+    return len(get_combined_symbols(state))
 
 
 def get_min_confidence(state: Dict) -> int:
@@ -721,7 +782,305 @@ def compute_display_probability(
     return clamp(fallback, 0.01, 0.95)
 
 
-def handle_command(text: str, chat_id: int, state: Dict) -> None:
+class ManualMemoryEngine:
+    def __init__(
+        self,
+        exchange: ccxt.bybit,
+        state_getter,
+        state_saver,
+        logger,
+        caches: Dict,
+    ):
+        self.exchange = exchange
+        self._state_getter = state_getter
+        self._state_saver = state_saver
+        self._logger = logger
+        self._caches = caches
+        self._caches.setdefault("markets", {"ts": 0.0, "symbols": set()})
+
+    def _log(self, message: str) -> None:
+        if self._logger:
+            self._logger(message)
+        else:
+            print(message)
+
+    def _get_state(self) -> Dict:
+        return self._state_getter()
+
+    def _save_state(self, state: Dict) -> None:
+        self._state_saver(state)
+
+    def normalize_symbol(self, raw: str) -> str:
+        if not raw:
+            return ""
+        cleaned = re.sub(r"\s+", " ", raw.strip().upper())
+        if "/" in cleaned:
+            base, quote = [part.strip() for part in cleaned.split("/", 1)]
+            if base and quote:
+                return f"{base}/{quote}"
+            return ""
+        if " " in cleaned:
+            parts = [part for part in cleaned.split(" ") if part]
+            if len(parts) == 2:
+                return f"{parts[0]}/{parts[1]}"
+            return ""
+        if cleaned.endswith(MANUAL_SYMBOL_QUOTE) and len(cleaned) > len(MANUAL_SYMBOL_QUOTE):
+            base = cleaned[:-len(MANUAL_SYMBOL_QUOTE)]
+            return f"{base}/{MANUAL_SYMBOL_QUOTE}"
+        return ""
+
+    def _load_markets_cached(self) -> Optional[set]:
+        cache = self._caches.setdefault("markets", {"ts": 0.0, "symbols": set()})
+        now = time.time()
+        if cache.get("symbols") and now - float(cache.get("ts", 0.0)) < MANUAL_MARKETS_CACHE_TTL:
+            return cache.get("symbols")
+        try:
+            markets = self.exchange.load_markets()
+            symbols = set(self.exchange.symbols or markets.keys())
+            cache["symbols"] = symbols
+            cache["ts"] = now
+            return symbols
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                _log_rate_limit_once("load_markets manual")
+            self._log(f"[MANUAL] load_markets error: {e}")
+            return None
+
+    def validate_symbol_exists(self, symbol: str) -> Tuple[bool, Optional[str]]:
+        symbols = self._load_markets_cached()
+        if symbols is None:
+            return False, "Не удалось проверить пару на Bybit. Попробуй позже."
+        candidates = {symbol, to_ccxt_manual_symbol(symbol)}
+        if symbol.endswith(f"/{MANUAL_SYMBOL_QUOTE}"):
+            candidates.add(f"{symbol}:{MANUAL_SYMBOL_QUOTE}")
+        if any(candidate in symbols for candidate in candidates):
+            return True, None
+        return (
+            False,
+            f"Пара {symbol} не найдена на Bybit. Проверь формат (пример: BTC/USDT) и попробуй снова.",
+        )
+
+    def add_symbol(self, symbol: str) -> bool:
+        with state_lock:
+            state = self._get_state()
+            ensure_manual_watchlist(state)
+            watchlist = state.get("manual_watchlist", [])
+            limit = state.get("manual_watchlist_limit")
+            if limit is not None and len(watchlist) >= int(limit):
+                return False
+            normalized = symbol.upper()
+            if any(item.upper() == normalized for item in watchlist):
+                return False
+            watchlist.append(normalized)
+            state["manual_watchlist"] = watchlist
+            self._save_state(state)
+        return True
+
+    def remove_symbol(self, symbol: str) -> bool:
+        with state_lock:
+            state = self._get_state()
+            ensure_manual_watchlist(state)
+            watchlist = state.get("manual_watchlist", [])
+            normalized = symbol.upper()
+            next_list = [item for item in watchlist if item.upper() != normalized]
+            if len(next_list) == len(watchlist):
+                return False
+            state["manual_watchlist"] = next_list
+            self._save_state(state)
+        return True
+
+    def list_symbols(self) -> List[str]:
+        with state_lock:
+            state = self._get_state()
+            ensure_manual_watchlist(state)
+            return list(state.get("manual_watchlist", []))
+
+    def _encode_symbol(self, symbol: str) -> str:
+        return symbol.replace("/", "_")
+
+    def decode_symbol(self, value: str) -> str:
+        return value.replace("_", "/")
+
+    def build_remove_keyboard(self) -> Dict:
+        symbols = self.list_symbols()
+        buttons = []
+        row = []
+        for symbol in symbols:
+            row.append({
+                "text": symbol,
+                "callback_data": f"manual:remove:{self._encode_symbol(symbol)}",
+            })
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([{"text": "⬅️ Назад", "callback_data": "manual:back_menu"}])
+        return {"inline_keyboard": buttons}
+
+    def build_confirm_remove_keyboard(self, symbol: str) -> Dict:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Да", "callback_data": "manual:remove_yes"},
+                    {"text": "❌ Нет", "callback_data": "manual:remove_no"},
+                ]
+            ]
+        }
+
+    def build_yes_no_watch_keyboard(self, symbol: str) -> Dict:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Да", "callback_data": "manual:watch_yes"},
+                    {"text": "❌ Нет", "callback_data": "manual:watch_no"},
+                ]
+            ]
+        }
+
+    def render_verdict(self, analysis_result: Optional[Dict]) -> str:
+        if not analysis_result:
+            return "Сигналов нет."
+        message = analysis_result.get("message")
+        if message:
+            return message
+        if analysis_result.get("status") == "error":
+            return analysis_result.get("error", "Ошибка анализа.")
+        return "Сигналов нет."
+
+    def run_one_off_analysis(self, symbol: str) -> Dict:
+        ccxt_symbol = to_ccxt_manual_symbol(symbol)
+        try:
+            if ENGINE_V2_ENABLED:
+                base_parsed = fetch_ohlcv_cached(
+                    self.exchange,
+                    ccxt_symbol,
+                    BASE_TIMEFRAME,
+                    limit=300,
+                    ttl_seconds=25,
+                )
+                if not base_parsed:
+                    return {"status": "error", "error": "Данные недоступны."}
+                base_data = _parsed_to_dict(base_parsed)
+                if len(base_data["closes"]) < 220:
+                    return {"status": "none"}
+                higher_data = None
+                if ENGINE_V2_USE_MTF:
+                    higher_parsed = fetch_ohlcv_cached(
+                        self.exchange,
+                        ccxt_symbol,
+                        HIGHER_TIMEFRAME,
+                        limit=300,
+                        ttl_seconds=600,
+                    )
+                    higher_data = _parsed_to_dict(higher_parsed) if higher_parsed else None
+                features = build_features(base_data)
+                if not features:
+                    return {"status": "none"}
+                regime = detect_regime(features)
+                setups = (
+                    generate_setups(ccxt_symbol, base_data, higher_data, features, regime)
+                    if ENGINE_V2_SETUP_ENABLED
+                    else []
+                )
+                if not setups:
+                    return {"status": "none"}
+                live_price = get_live_price_if_needed(
+                    self.exchange,
+                    ccxt_symbol,
+                    base_data["closes"][-1],
+                    has_active_setup=True,
+                )
+                if live_price is None:
+                    return {"status": "error", "error": "Не удалось получить цену."}
+                best_entry = None
+                if ENGINE_V2_ENTRY_ENABLED:
+                    for setup in setups:
+                        entry = check_trigger(setup, live_price, base_data, features)
+                        if not entry:
+                            continue
+                        if not best_entry or entry["confidence"] > best_entry["entry"]["confidence"]:
+                            best_entry = {"setup": setup, "entry": entry}
+                if best_entry:
+                    settings = get_settings_snapshot(self._get_state())
+                    atr_val = features.get("atr")
+                    lows = base_data["lows"]
+                    highs = base_data["highs"]
+                    swing_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+                    swing_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+                    risk_result = evaluate_risk(
+                        direction=best_entry["setup"]["direction"],
+                        entry_price=best_entry["entry"]["entry_price"],
+                        atr=atr_val,
+                        swing_high=swing_high,
+                        swing_low=swing_low,
+                        leverage=int(settings["leverage"]),
+                        position_usd=float(settings["position_usd"]),
+                    )
+                    message = format_entry_message(
+                        ccxt_symbol,
+                        best_entry["setup"]["direction"],
+                        best_entry["entry"],
+                        risk_result,
+                        settings,
+                    )
+                    return {"status": "entry", "message": message}
+                best_setup = max(setups, key=lambda item: item.get("setup_score", 0))
+                return {"status": "setup", "message": format_setup_message(best_setup)}
+            parsed = fetch_ohlcv_cached(
+                self.exchange,
+                ccxt_symbol,
+                TIMEFRAME,
+                limit=300,
+                ttl_seconds=25,
+            )
+            if not parsed:
+                return {"status": "error", "error": "Данные недоступны."}
+            highs, lows, closes, volumes, _ = parsed
+            signal, info = compute_signal(highs, lows, closes, volumes)
+            if not signal:
+                return {"status": "none"}
+            direction = "LONG" if signal == "UP" else "SHORT"
+            display_probability = compute_display_probability(None, info)
+            pair_text = f"{normalize_symbol(ccxt_symbol)} / {MANUAL_SYMBOL_QUOTE}"
+            message = (
+                "🔍 Анализ\n"
+                "━━━━━━━━━━━━━━━━\n"
+                f"🪙 Пара: {pair_text}\n"
+                f"📍 Направление: {'ВВЕРХ ⬆️' if direction == 'LONG' else 'ВНИЗ ⬇️'}\n"
+                f"💰 Цена: {format_price(info.get('price'))}\n"
+                "🎯 Вероятность\n"
+                f"{probability_bar(display_probability)} {display_probability*100:.2f}%\n"
+                "━━━━━━━━━━━━━━━━"
+            )
+            return {"status": "entry", "message": message}
+        except Exception as e:
+            self._log(f"[MANUAL] analysis error: {e}")
+            return {"status": "error", "error": "Ошибка анализа."}
+
+    def integrate_symbols(self, base_symbols: List[str]) -> List[str]:
+        manual_symbols = [to_ccxt_manual_symbol(symbol) for symbol in self.list_symbols()]
+        combined: List[str] = []
+        seen = set()
+        for symbol in base_symbols + manual_symbols:
+            key = symbol.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(symbol)
+        return combined
+
+
+def manual_menu_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [{"text": "📈 Сделать анализ", "callback_data": "manual:action:analyze"}],
+            [{"text": "🗑 Убрать монету из памяти", "callback_data": "manual:action:remove"}],
+        ]
+    }
+
+
+def handle_command(text: str, chat_id: int, state: Dict, manual_engine: ManualMemoryEngine) -> None:
     global MIN_CONFIDENCE
     parts = text.strip().split()
     if not parts:
@@ -733,7 +1092,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         settings = get_settings_snapshot(state)
         tg_send(
             "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
-            f"🧠 Анализ активов: {len([coin for coin, enabled in settings['coins'].items() if enabled])}\n"
+            f"🧠 Анализ активов: {get_combined_symbol_count(state)}\n"
             f"⏱ Таймфрейм: {TIMEFRAME}\n"
             f"📊 Минимальная уверенность: {settings['min_confidence']}%\n"
             f"🛡 Антиспам: {COOLDOWN_MINUTES} мин",
@@ -747,7 +1106,7 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         tg_send(
             "🧠 Статус системы\n"
             "━━━━━━━━━━━━━━━━\n"
-            f"🪙 Анализ активов: {len([coin for coin, enabled in settings['coins'].items() if enabled])}\n"
+            f"🪙 Анализ активов: {get_combined_symbol_count(state)}\n"
             f"⏱ Таймфрейм: {TIMEFRAME}\n"
             f"🔄 Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
             f"🎯 Мин. уверенность: {settings['min_confidence']}%\n"
@@ -787,6 +1146,31 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             chat_id=chat_id,
             reply_markup=help_inline_keyboard(),
         )
+        return
+
+    if command == "/analyze":
+        with state_lock:
+            ensure_manual_watchlist(state)
+            watchlist = state.get("manual_watchlist", [])
+        if watchlist:
+            tg_send(
+                "🔍 Анализ\n"
+                "━━━━━━━━━━━━━━━━\n"
+                "Выберите действие:",
+                chat_id=chat_id,
+                reply_markup=manual_menu_keyboard(),
+            )
+        else:
+            with state_lock:
+                manual_state = state.setdefault("manual_analysis", {})
+                manual_state["awaiting_symbol"] = True
+                manual_state["pending_symbol"] = None
+                manual_state["pending_remove"] = None
+                save_state(state)
+            tg_send(
+                "На какую монету сделать анализ? (пример: BTC/USDT)",
+                chat_id=chat_id,
+            )
         return
 
     if command == "/now_menu":
@@ -2469,7 +2853,7 @@ def engine_v2_cycle(
     min_confidence = int(settings_snapshot["min_confidence"])
     leverage_value = int(settings_snapshot["leverage"])
     position_usd = float(settings_snapshot["position_usd"])
-    enabled_symbols = get_enabled_symbols(state)
+    enabled_symbols = get_combined_symbols(state)
     for symbol in enabled_symbols:
         # 15m TTL = 25s, 1h TTL = 600s (anti rate-limit, no behavior change)
         base_parsed = fetch_ohlcv_cached(exchange, symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
@@ -2751,7 +3135,7 @@ def run_signal_cycle(
 
     last_signal = None
     candidates = []
-    enabled_symbols = get_enabled_symbols(state)
+    enabled_symbols = get_combined_symbols(state)
 
     def _fetch(symbol: str):
         try:
@@ -2881,7 +3265,7 @@ def run_signal_cycle(
 
 
 # ================== MAIN ==================
-def command_loop(state: Dict) -> None:
+def command_loop(state: Dict, manual_engine: ManualMemoryEngine) -> None:
     global MIN_CONFIDENCE
     update_offset = 0
     BUTTON_TO_COMMAND = {
@@ -2891,6 +3275,7 @@ def command_loop(state: Dict) -> None:
         "🎯 Confidence": "/confidence",
         "⚙️ Настройки": "/settings",
         "⏯ Старт / Пауза": "/toggle",
+        "🔍 Анализ": "/analyze",
         "ℹ️ Помощь": "/help",
     }
     CALLBACK_TO_COMMAND = {
@@ -2901,6 +3286,7 @@ def command_loop(state: Dict) -> None:
         "cmd:toggle": "/toggle",
         "cmd:now": "/now",
         "cmd:now_menu": "/now_menu",
+        "menu_analyze": "/analyze",
     }
     # flush old updates on startup (do not process backlog)
     try:
@@ -2933,10 +3319,194 @@ def command_loop(state: Dict) -> None:
                     if data.startswith("cmd:"):
                         cmd = CALLBACK_TO_COMMAND.get(data)
                         if cmd:
-                            handle_command(cmd, chat_id, state)
+                            handle_command(cmd, chat_id, state, manual_engine)
                         continue
+                    if data.startswith("manual:"):
+                        if data == "manual:action:analyze":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                manual_state["awaiting_symbol"] = True
+                                manual_state["pending_symbol"] = None
+                                manual_state["pending_remove"] = None
+                                save_state(state)
+                            tg_send(
+                                "На какую монету сделать анализ? (пример: BTC/USDT)",
+                                chat_id=chat_id,
+                            )
+                            continue
+                        if data == "manual:action:remove":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                manual_state["awaiting_symbol"] = False
+                                manual_state["pending_symbol"] = None
+                                manual_state["pending_remove"] = None
+                                save_state(state)
+                            symbols = manual_engine.list_symbols()
+                            if not symbols:
+                                tg_send("В памяти нет монет.", chat_id=chat_id)
+                                tg_send(
+                                    "🔍 Анализ\n"
+                                    "━━━━━━━━━━━━━━━━\n"
+                                    "Выберите действие:",
+                                    chat_id=chat_id,
+                                    reply_markup=manual_menu_keyboard(),
+                                )
+                                continue
+                            text = "Выберите монету для удаления:"
+                            if message_id:
+                                tg_edit_message(
+                                    text,
+                                    chat_id,
+                                    message_id,
+                                    reply_markup=manual_engine.build_remove_keyboard(),
+                                )
+                            else:
+                                tg_send(
+                                    text,
+                                    chat_id=chat_id,
+                                    reply_markup=manual_engine.build_remove_keyboard(),
+                                )
+                            continue
+                        if data == "manual:back_menu":
+                            symbols = manual_engine.list_symbols()
+                            if symbols:
+                                tg_send(
+                                    "🔍 Анализ\n"
+                                    "━━━━━━━━━━━━━━━━\n"
+                                    "Выберите действие:",
+                                    chat_id=chat_id,
+                                    reply_markup=manual_menu_keyboard(),
+                                )
+                            else:
+                                with state_lock:
+                                    manual_state = state.setdefault("manual_analysis", {})
+                                    manual_state["awaiting_symbol"] = True
+                                    manual_state["pending_symbol"] = None
+                                    manual_state["pending_remove"] = None
+                                    save_state(state)
+                                tg_send(
+                                    "На какую монету сделать анализ? (пример: BTC/USDT)",
+                                    chat_id=chat_id,
+                                )
+                            continue
+                        if data.startswith("manual:remove:"):
+                            encoded = data.split(":", 2)[-1]
+                            symbol = manual_engine.decode_symbol(encoded)
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                manual_state["pending_remove"] = symbol
+                                manual_state["awaiting_symbol"] = False
+                                save_state(state)
+                            text = f"Убрать {symbol} из памяти?"
+                            if message_id:
+                                tg_edit_message(
+                                    text,
+                                    chat_id,
+                                    message_id,
+                                    reply_markup=manual_engine.build_confirm_remove_keyboard(symbol),
+                                )
+                            else:
+                                tg_send(
+                                    text,
+                                    chat_id=chat_id,
+                                    reply_markup=manual_engine.build_confirm_remove_keyboard(symbol),
+                                )
+                            continue
+                        if data == "manual:remove_yes":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                pending_remove = manual_state.get("pending_remove")
+                                manual_state["pending_remove"] = None
+                                save_state(state)
+                            if pending_remove:
+                                manual_engine.remove_symbol(pending_remove)
+                            symbols = manual_engine.list_symbols()
+                            if symbols:
+                                text = "Выберите монету для удаления:"
+                                if message_id:
+                                    tg_edit_message(
+                                        text,
+                                        chat_id,
+                                        message_id,
+                                        reply_markup=manual_engine.build_remove_keyboard(),
+                                    )
+                                else:
+                                    tg_send(
+                                        text,
+                                        chat_id=chat_id,
+                                        reply_markup=manual_engine.build_remove_keyboard(),
+                                    )
+                            else:
+                                if message_id:
+                                    tg_edit_message(
+                                        "Память пустая.",
+                                        chat_id,
+                                        message_id,
+                                        reply_markup={"inline_keyboard": []},
+                                    )
+                                else:
+                                    tg_send("Память пустая.", chat_id=chat_id)
+                                tg_send(
+                                    "🔍 Анализ\n"
+                                    "━━━━━━━━━━━━━━━━\n"
+                                    "Выберите действие:",
+                                    chat_id=chat_id,
+                                    reply_markup=manual_menu_keyboard(),
+                                )
+                            continue
+                        if data == "manual:remove_no":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                manual_state["pending_remove"] = None
+                                save_state(state)
+                            tg_send(
+                                "Хорошо. Монета остаётся под наблюдением.",
+                                chat_id=chat_id,
+                            )
+                            symbols = manual_engine.list_symbols()
+                            if symbols:
+                                text = "Выберите монету для удаления:"
+                                if message_id:
+                                    tg_edit_message(
+                                        text,
+                                        chat_id,
+                                        message_id,
+                                        reply_markup=manual_engine.build_remove_keyboard(),
+                                    )
+                                else:
+                                    tg_send(
+                                        text,
+                                        chat_id=chat_id,
+                                        reply_markup=manual_engine.build_remove_keyboard(),
+                                    )
+                            continue
+                        if data == "manual:watch_yes":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                pending_symbol = manual_state.get("pending_symbol")
+                                manual_state["pending_symbol"] = None
+                                manual_state["awaiting_symbol"] = False
+                                save_state(state)
+                            if pending_symbol:
+                                added = manual_engine.add_symbol(pending_symbol)
+                                tg_send(
+                                    "Ок. Добавил в наблюдение." if added else "Монета уже в наблюдении.",
+                                    chat_id=chat_id,
+                                    reply_markup=main_keyboard(),
+                                )
+                            else:
+                                tg_send("Ок.", chat_id=chat_id, reply_markup=main_keyboard())
+                            continue
+                        if data == "manual:watch_no":
+                            with state_lock:
+                                manual_state = state.setdefault("manual_analysis", {})
+                                manual_state["pending_symbol"] = None
+                                manual_state["awaiting_symbol"] = False
+                                save_state(state)
+                            tg_send("Ок. Не добавляю.", chat_id=chat_id, reply_markup=main_keyboard())
+                            continue
                     if data == "now:run":
-                        handle_command("/now", chat_id, state)
+                        handle_command("/now", chat_id, state, manual_engine)
                         continue
                     if data == "now:news":
                         if message_id:
@@ -3069,10 +3639,10 @@ def command_loop(state: Dict) -> None:
                             tg_send(prompt_map[field], chat_id=chat_id)
                         continue
                     if data == "news:show":
-                        handle_command("/news", chat_id, state)
+                        handle_command("/news", chat_id, state, manual_engine)
                         continue
                     if data == "news:on":
-                        handle_command("/news_on", chat_id, state)
+                        handle_command("/news_on", chat_id, state, manual_engine)
                         if message_id:
                             tg_edit_message(
                                 build_news_menu_text(state),
@@ -3082,7 +3652,7 @@ def command_loop(state: Dict) -> None:
                             )
                         continue
                     if data == "news:off":
-                        handle_command("/news_off", chat_id, state)
+                        handle_command("/news_off", chat_id, state, manual_engine)
                         if message_id:
                             tg_edit_message(
                                 build_news_menu_text(state),
@@ -3092,10 +3662,10 @@ def command_loop(state: Dict) -> None:
                             )
                         continue
                     if data == "news:sources":
-                        handle_command("/news_sources", chat_id, state)
+                        handle_command("/news_sources", chat_id, state, manual_engine)
                         continue
                     if data == "news:test":
-                        handle_command("/news_test", chat_id, state)
+                        handle_command("/news_test", chat_id, state, manual_engine)
                         continue
                     if data == "news:level_menu":
                         with state_lock:
@@ -3190,7 +3760,7 @@ def command_loop(state: Dict) -> None:
                     if data.startswith("news:level:"):
                         level_part = data.split(":", 2)[-1]
                         if level_part.isdigit():
-                            handle_command(f"/news_level {level_part}", chat_id, state)
+                            handle_command(f"/news_level {level_part}", chat_id, state, manual_engine)
                         if message_id:
                             tg_edit_message(
                                 build_news_menu_text(state),
@@ -3303,13 +3873,50 @@ def command_loop(state: Dict) -> None:
                     else:
                         tg_send("❌ Введите число 1–99.", chat_id=chat_id)
                     continue
+                with state_lock:
+                    manual_state = state.get("manual_analysis", {})
+                    awaiting_symbol = manual_state.get("awaiting_symbol", False)
+                if awaiting_symbol:
+                    normalized = manual_engine.normalize_symbol(text or "")
+                    if not normalized:
+                        tg_send(
+                            "Неверный формат. Пример: BTC/USDT",
+                            chat_id=chat_id,
+                        )
+                        tg_send(
+                            "На какую монету сделать анализ? (пример: BTC/USDT)",
+                            chat_id=chat_id,
+                        )
+                        continue
+                    ok, message = manual_engine.validate_symbol_exists(normalized)
+                    if not ok:
+                        tg_send(message or "Пара не найдена.", chat_id=chat_id)
+                        tg_send(
+                            "На какую монету сделать анализ? (пример: BTC/USDT)",
+                            chat_id=chat_id,
+                        )
+                        continue
+                    analysis_result = manual_engine.run_one_off_analysis(normalized)
+                    tg_send(manual_engine.render_verdict(analysis_result), chat_id=chat_id)
+                    with state_lock:
+                        manual_state = state.setdefault("manual_analysis", {})
+                        manual_state["awaiting_symbol"] = False
+                        manual_state["pending_symbol"] = normalized
+                        manual_state["pending_remove"] = None
+                        save_state(state)
+                    tg_send(
+                        "Продолжать наблюдение за этой монетой?",
+                        chat_id=chat_id,
+                        reply_markup=manual_engine.build_yes_no_watch_keyboard(normalized),
+                    )
+                    continue
                 cmd = None
                 if text.startswith("/"):
                     cmd = text
                 else:
                     cmd = BUTTON_TO_COMMAND.get(text)
                 if cmd:
-                    handle_command(cmd, chat_id, state)
+                    handle_command(cmd, chat_id, state, manual_engine)
         except Exception as e:
             print(f"[telegram] ERROR: {e}")
 
@@ -3401,6 +4008,7 @@ def main() -> None:
         state.setdefault("news_price_last_check", {})
         state.setdefault("news_last_poll_ts", 0)
         settings = ensure_settings(state)
+        ensure_manual_watchlist(state)
         try:
             MIN_CONFIDENCE = int(settings.get("min_confidence", default_confidence))
         except (TypeError, ValueError):
@@ -3416,7 +4024,7 @@ def main() -> None:
     )
     tg_send(
         "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
-        f"🧠 Анализ активов: {len(get_enabled_symbol_codes(state))}\n"
+        f"🧠 Анализ активов: {get_combined_symbol_count(state)}\n"
         f"⏱ Таймфрейм: {TIMEFRAME}\n"
         f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
         f"🛡 Антиспам: {COOLDOWN_MINUTES} мин"
@@ -3428,7 +4036,15 @@ def main() -> None:
         news_thread = threading.Thread(target=news_worker, args=(exchange, state), daemon=True)
         news_thread.start()
 
-    command_thread = threading.Thread(target=command_loop, args=(state,), daemon=True)
+    manual_engine = ManualMemoryEngine(
+        exchange=exchange,
+        state_getter=lambda: state,
+        state_saver=save_state,
+        logger=print,
+        caches={},
+    )
+
+    command_thread = threading.Thread(target=command_loop, args=(state, manual_engine), daemon=True)
     signal_thread = threading.Thread(target=signal_loop, args=(exchange, state), daemon=True)
     command_thread.start()
     signal_thread.start()
