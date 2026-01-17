@@ -17,6 +17,7 @@ import ccxt
 import pandas as pd
 import requests
 
+from risk_engine import evaluate_risk
 
 # ================== ТВОИ ДАННЫЕ ==================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -28,23 +29,40 @@ BYBIT_API_SECRET = ""
 
 
 # ================== НАСТРОЙКИ ==================
-SYMBOLS = [
-    "BTC/USDT:USDT",
-    "XRP/USDT:USDT",
-    "SOL/USDT:USDT",
-    "ETH/USDT:USDT",
-    "BNB/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LINK/USDT:USDT",
-    "NEAR/USDT:USDT",
-    "DOT/USDT:USDT",
-    "XLM/USDT:USDT",
+ALL_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "TONUSDT",
+    "MATICUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "XLMUSDT",
+    "ATOMUSDT",
+    "ETCUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "NEARUSDT",
+    "FILUSDT",
+    "ICPUSDT",
+    "SUIUSDT",
 ]
 
 TIMEFRAME = "15m"
 CHECK_EVERY_SECONDS = 60
 COOLDOWN_MINUTES = 90
 MIN_CONFIDENCE = 62
+DEFAULT_LEVERAGE = 10
+DEFAULT_POSITION_USD = 25.0
 
 # News system config
 NEWS_ENABLED = True
@@ -209,7 +227,7 @@ def main_keyboard() -> Dict:
         "keyboard": [
             [{"text": "📊 Статус"}, {"text": "⚡ Сейчас"}],
             [{"text": "📌 Сигналы"}, {"text": "🎯 Confidence"}],
-            [{"text": "⚙️ SetConfidence"}, {"text": "⏯ Старт / Пауза"}],
+            [{"text": "⚙️ Настройки"}, {"text": "⏯ Старт / Пауза"}],
             [{"text": "ℹ️ Помощь"}],
         ],
         "resize_keyboard": True,
@@ -225,9 +243,10 @@ def build_help_text() -> str:
         "📊 Статус\n"
         "📌 Сигналы\n"
         "🎯 Confidence\n"
-        "⚙️ SetConfidence\n"
+        "⚙️ Настройки\n"
         "⏯ Старт / Пауза\n"
         "⚡ Сейчас\n"
+        "⚙️ /settings\n"
         "📰 /news\n"
         "📰 /news_on\n"
         "📰 /news_off\n"
@@ -251,7 +270,7 @@ def help_inline_keyboard() -> Dict:
                 {"text": "🎯 Confidence", "callback_data": "cmd:confidence"},
             ],
             [
-                {"text": "⚙️ SetConfidence", "callback_data": "cmd:setconfidence"},
+                {"text": "⚙️ Настройки", "callback_data": "cmd:settings"},
             ],
             [
                 {"text": "⏯ Старт / Пауза", "callback_data": "cmd:toggle"},
@@ -351,6 +370,62 @@ def build_news_level_text(current_level: int) -> str:
     )
 
 
+def build_settings_text(state: Dict) -> str:
+    settings = get_settings_snapshot(state)
+    enabled_count = len([coin for coin, enabled in settings["coins"].items() if enabled])
+    return (
+        "⚙️ Настройки\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📐 Плечо: {settings['leverage']}x\n"
+        f"💰 Сумма: {format_usd(settings['position_usd'])}\n"
+        f"🎯 Мин. уверенность: {settings['min_confidence']}%\n"
+        f"🪙 Активов в анализе: {enabled_count}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def settings_inline_keyboard() -> Dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📐 Плечо", "callback_data": "settings:leverage"},
+                {"text": "💰 Сумма", "callback_data": "settings:position_usd"},
+            ],
+            [{"text": "🎯 Мин. уверенность", "callback_data": "settings:min_confidence"}],
+            [{"text": "🪙 Монеты", "callback_data": "settings:coins"}],
+            [{"text": "⬅️ Назад", "callback_data": "settings:back"}],
+        ]
+    }
+
+
+def build_settings_coins_text(state: Dict) -> str:
+    settings = get_settings_snapshot(state)
+    enabled_count = len([coin for coin, enabled in settings["coins"].items() if enabled])
+    return (
+        "⚙️ Настройки → Монеты\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"Анализ активов: {enabled_count}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def settings_coins_inline_keyboard(state: Dict) -> Dict:
+    settings = get_settings_snapshot(state)
+    buttons = []
+    row = []
+    for symbol in ALL_SYMBOLS:
+        enabled = settings["coins"].get(symbol, False)
+        label = f"{'✅' if enabled else '❌'} {symbol}"
+        row.append({"text": label, "callback_data": f"settings:coin:{symbol}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"text": "⬅️ Назад", "callback_data": "settings:back_panel"}])
+    return {"inline_keyboard": buttons}
+
+
 # ================== STATE ==================
 def load_state() -> Dict:
     try:
@@ -365,12 +440,73 @@ def save_state(state: Dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def build_default_settings() -> Dict:
+    return {
+        "leverage": DEFAULT_LEVERAGE,
+        "position_usd": DEFAULT_POSITION_USD,
+        "min_confidence": MIN_CONFIDENCE,
+        "coins": {symbol: True for symbol in ALL_SYMBOLS},
+    }
+
+
+def to_ccxt_symbol(symbol_code: str) -> str:
+    if symbol_code.endswith("USDT"):
+        base = symbol_code[:-4]
+        return f"{base}/USDT:USDT"
+    return symbol_code
+
+
+def ensure_settings(state: Dict) -> Dict:
+    settings = state.setdefault("settings", build_default_settings())
+    settings.setdefault("leverage", DEFAULT_LEVERAGE)
+    settings.setdefault("position_usd", DEFAULT_POSITION_USD)
+    settings.setdefault("min_confidence", MIN_CONFIDENCE)
+    coins = settings.setdefault("coins", {symbol: True for symbol in ALL_SYMBOLS})
+    for symbol in ALL_SYMBOLS:
+        coins.setdefault(symbol, True)
+    settings["coins"] = coins
+    state["min_confidence"] = settings["min_confidence"]
+    return settings
+
+
+def get_settings_snapshot(state: Dict) -> Dict:
+    with state_lock:
+        settings = ensure_settings(state)
+        return {
+            "leverage": settings.get("leverage", DEFAULT_LEVERAGE),
+            "position_usd": settings.get("position_usd", DEFAULT_POSITION_USD),
+            "min_confidence": settings.get("min_confidence", MIN_CONFIDENCE),
+            "coins": dict(settings.get("coins", {})),
+        }
+
+
+def get_enabled_symbol_codes(state: Dict) -> List[str]:
+    settings = get_settings_snapshot(state)
+    return [symbol for symbol in ALL_SYMBOLS if settings["coins"].get(symbol, False)]
+
+
+def get_enabled_symbols(state: Dict) -> List[str]:
+    return [to_ccxt_symbol(symbol) for symbol in get_enabled_symbol_codes(state)]
+
+
+def get_min_confidence(state: Dict) -> int:
+    settings = get_settings_snapshot(state)
+    return int(settings.get("min_confidence", MIN_CONFIDENCE))
+
+
+def format_usd(value: float) -> str:
+    amount = float(value)
+    if amount.is_integer():
+        return f"${int(amount)}"
+    return f"${amount:.2f}"
+
+
 def normalize_symbol(symbol: str) -> str:
     return symbol.split("/")[0]
 
 
 def format_pairs(separator: str) -> str:
-    return separator.join([normalize_symbol(s) for s in SYMBOLS])
+    return separator.join([symbol for symbol in ALL_SYMBOLS])
 
 
 def format_last_signal(last_signal: Optional[Dict]) -> str:
@@ -462,11 +598,12 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
     command = parts[0].lower()
 
     if command == "/start":
+        settings = get_settings_snapshot(state)
         tg_send(
             "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
-            f"🧠 Анализ активов: {len(SYMBOLS)}\n"
+            f"🧠 Анализ активов: {len([coin for coin, enabled in settings['coins'].items() if enabled])}\n"
             f"⏱ Таймфрейм: {TIMEFRAME}\n"
-            f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
+            f"📊 Минимальная уверенность: {settings['min_confidence']}%\n"
             f"🛡 Антиспам: {COOLDOWN_MINUTES} мин",
             chat_id=chat_id,
             reply_markup=main_keyboard(),
@@ -474,13 +611,14 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         return
 
     if command == "/status":
+        settings = get_settings_snapshot(state)
         tg_send(
             "🧠 Статус системы\n"
             "━━━━━━━━━━━━━━━━\n"
-            f"🪙 Анализ активов: {len(SYMBOLS)}\n"
+            f"🪙 Анализ активов: {len([coin for coin, enabled in settings['coins'].items() if enabled])}\n"
             f"⏱ Таймфрейм: {TIMEFRAME}\n"
             f"🔄 Проверка: каждые {CHECK_EVERY_SECONDS} сек\n"
-            f"🎯 Мин. уверенность: {MIN_CONFIDENCE}%\n"
+            f"🎯 Мин. уверенность: {settings['min_confidence']}%\n"
             "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
         )
@@ -493,12 +631,21 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
         return
 
     if command == "/confidence":
+        settings = get_settings_snapshot(state)
         tg_send(
             "🎯 НАСТРОЙКА УВЕРЕННОСТИ\n"
             "━━━━━━━━━━━━━━━━\n"
-            f"🎯 Минимальная уверенность : {MIN_CONFIDENCE}%\n"
+            f"🎯 Минимальная уверенность : {settings['min_confidence']}%\n"
             "━━━━━━━━━━━━━━━━",
             chat_id=chat_id,
+        )
+        return
+
+    if command == "/settings":
+        tg_send(
+            build_settings_text(state),
+            chat_id=chat_id,
+            reply_markup=settings_inline_keyboard(),
         )
         return
 
@@ -629,13 +776,15 @@ def handle_command(text: str, chat_id: int, state: Dict) -> None:
             value = int(parts[1])
             if 1 <= value <= 99:
                 with state_lock:
-                    MIN_CONFIDENCE = value
+                    settings = ensure_settings(state)
+                    settings["min_confidence"] = value
                     state["min_confidence"] = value
+                    MIN_CONFIDENCE = value
                     save_state(state)
                 tg_send(
                     "✅ НАСТРОЙКА ОБНОВЛЕНА\n"
                     "━━━━━━━━━━━━━━━━\n"
-                    f"🎯 Мин. уверенность : {MIN_CONFIDENCE}%\n"
+                    f"🎯 Мин. уверенность : {value}%\n"
                     "━━━━━━━━━━━━━━━━",
                     chat_id=chat_id,
                 )
@@ -1314,7 +1463,8 @@ def news_poll_once(
         title_count[title_hash] = title_count.get(title_hash, 0) + 1
         source_by_title.setdefault(title_hash, set()).add(item.provider)
 
-    symbol_map = {normalize_symbol(symbol): symbol for symbol in SYMBOLS}
+    all_ccxt_symbols = [to_ccxt_symbol(symbol) for symbol in ALL_SYMBOLS]
+    symbol_map = {normalize_symbol(symbol): symbol for symbol in all_ccxt_symbols}
     new_items: List[NewsItem] = []
 
     for item in raw_all:
@@ -2119,18 +2269,44 @@ def format_setup_message(setup: Dict) -> str:
     )
 
 
-def format_entry_message(symbol: str, direction: str, entry: Dict) -> str:
+def format_risk_engine_block(risk_result: Optional[Dict], settings: Dict) -> str:
+    if not risk_result:
+        return ""
+    if not risk_result.get("ok"):
+        reason = risk_result.get("reason", "слишком высокий риск")
+        return f"\n⚠️ Risk Engine: {reason}\n"
     return (
+        "\n🧮 Risk Engine\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📐 Плечо: {settings['leverage']}x\n"
+        f"💰 Сумма: {format_usd(settings['position_usd'])}\n"
+        f"💥 Ликвидация: {format_price(risk_result['liq_price'])}\n"
+        f"🛑 SL: {format_price(risk_result['sl'])}\n"
+        f"🎯 TP: {format_price(risk_result['tp'])}\n"
+        f"📉 Риск: -{format_usd(risk_result['risk_usd'])}\n"
+        f"📈 Профит: +{format_usd(risk_result['profit_usd'])}\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_entry_message(symbol: str, direction: str, entry: Dict, risk_result: Optional[Dict], settings: Dict) -> str:
+    sl_value = entry["sl"]
+    tp_value = entry["tp"]
+    if risk_result and risk_result.get("ok"):
+        sl_value = risk_result["sl"]
+        tp_value = risk_result["tp"]
+    message = (
         "◉ СИГНАЛ\n"
         "━━━━━━━━━━━━━━━━\n"
         f"📌 Пара: {normalize_symbol(symbol)} / USDT\n"
         f"📈 Направление: {direction}\n"
         f"🎯 Вход: {format_price(entry['entry_price'])}\n"
-        f"🛑 SL: {format_price(entry['sl'])}\n"
-        f"✅ TP: {format_price(entry['tp'])}\n"
+        f"🛑 SL: {format_price(sl_value)}\n"
+        f"✅ TP: {format_price(tp_value)}\n"
         f"🎯 Уверенность: {entry['confidence']:.2f}%\n"
         "━━━━━━━━━━━━━━━━"
     )
+    return message + format_risk_engine_block(risk_result, settings)
 
 
 def cleanup_open_setups(state: Dict) -> None:
@@ -2157,7 +2333,12 @@ def engine_v2_cycle(
 ) -> Optional[Dict]:
     last_signal = None
     cleanup_open_setups(state)
-    for symbol in SYMBOLS:
+    settings_snapshot = get_settings_snapshot(state)
+    min_confidence = int(settings_snapshot["min_confidence"])
+    leverage_value = int(settings_snapshot["leverage"])
+    position_usd = float(settings_snapshot["position_usd"])
+    enabled_symbols = get_enabled_symbols(state)
+    for symbol in enabled_symbols:
         # 15m TTL = 25s, 1h TTL = 600s (anti rate-limit, no behavior change)
         base_parsed = fetch_ohlcv_cached(exchange, symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
         if not base_parsed:
@@ -2230,25 +2411,44 @@ def engine_v2_cycle(
             entry = check_trigger(setup, live_price, base_data, features)
             if not entry:
                 continue
-            if entry["confidence"] < MIN_CONFIDENCE:
+            if entry["confidence"] < min_confidence:
                 continue
 
-            if send_signals:
-                tg_send(format_entry_message(symbol, direction, entry))
+            atr_val = features.get("atr")
+            lows = base_data["lows"]
+            highs = base_data["highs"]
+            swing_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+            swing_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+            risk_result = evaluate_risk(
+                direction=direction,
+                entry_price=entry["entry_price"],
+                atr=atr_val,
+                swing_high=swing_high,
+                swing_low=swing_low,
+                leverage=leverage_value,
+                position_usd=position_usd,
+            )
 
-            last_signal = {
-                "pair": normalize_symbol(symbol),
-                "direction": "UP" if direction == "LONG" else "DOWN",
-                "confidence": round(entry["confidence"]),
-                "probability": round(entry["confidence"], 2),
-                "price": entry["entry_price"],
-            }
+            if send_signals:
+                if risk_result and not risk_result.get("ok") and leverage_value >= 50:
+                    print(f"[RISK] blocked signal {symbol} {direction}: {risk_result.get('reason')}")
+                else:
+                    tg_send(format_entry_message(symbol, direction, entry, risk_result, settings_snapshot))
+
             with state_lock:
                 entry_memory[entry_key] = time.time()
                 state["entry_memory"] = entry_memory
-                state["last_signal"] = last_signal
                 open_setups.pop(setup_key, None)
                 state["open_setups"] = open_setups
+                if not (risk_result and not risk_result.get("ok") and leverage_value >= 50):
+                    last_signal = {
+                        "pair": normalize_symbol(symbol),
+                        "direction": "UP" if direction == "LONG" else "DOWN",
+                        "confidence": round(entry["confidence"]),
+                        "probability": round(entry["confidence"], 2),
+                        "price": entry["entry_price"],
+                    }
+                    state["last_signal"] = last_signal
                 save_state(state)
     return last_signal
 
@@ -2419,6 +2619,7 @@ def run_signal_cycle(
 
     last_signal = None
     candidates = []
+    enabled_symbols = get_enabled_symbols(state)
 
     def _fetch(symbol: str):
         try:
@@ -2435,7 +2636,7 @@ def run_signal_cycle(
 
     dfs = {}
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = [ex.submit(_fetch, s) for s in SYMBOLS]
+        futures = [ex.submit(_fetch, s) for s in enabled_symbols]
         for fut in as_completed(futures):
             symbol, df, err = fut.result()
             if err is not None:
@@ -2443,7 +2644,7 @@ def run_signal_cycle(
                 continue
             dfs[symbol] = df
 
-    for symbol in SYMBOLS:
+    for symbol in enabled_symbols:
         try:
             df = dfs.get(symbol)
             if df is None:
@@ -2497,7 +2698,7 @@ def run_signal_cycle(
         95,
     ) / 100
     numeric_probability = display_probability * 100
-    min_confidence = float(MIN_CONFIDENCE)
+    min_confidence = float(get_min_confidence(state))
     if numeric_probability < min_confidence:
         return last_signal
     prob_line = f"{probability_bar(display_probability)} {display_probability*100:.2f}%"
@@ -2556,7 +2757,7 @@ def command_loop(state: Dict) -> None:
         "⚡ Сейчас": "/now_menu",
         "📌 Сигналы": "/signals",
         "🎯 Confidence": "/confidence",
-        "⚙️ SetConfidence": "/setconfidence",
+        "⚙️ Настройки": "/settings",
         "⏯ Старт / Пауза": "/toggle",
         "ℹ️ Помощь": "/help",
     }
@@ -2564,7 +2765,7 @@ def command_loop(state: Dict) -> None:
         "cmd:status": "/status",
         "cmd:signals": "/signals",
         "cmd:confidence": "/confidence",
-        "cmd:setconfidence": "/setconfidence",
+        "cmd:settings": "/settings",
         "cmd:toggle": "/toggle",
         "cmd:now": "/now",
         "cmd:now_menu": "/now_menu",
@@ -2660,6 +2861,80 @@ def command_loop(state: Dict) -> None:
                             )
                         else:
                             tg_send("✅ Меню закрыто", chat_id=chat_id)
+                        continue
+                    if data == "settings:coins":
+                        if message_id:
+                            tg_edit_message(
+                                build_settings_coins_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=settings_coins_inline_keyboard(state),
+                            )
+                        else:
+                            tg_send(
+                                build_settings_coins_text(state),
+                                chat_id=chat_id,
+                                reply_markup=settings_coins_inline_keyboard(state),
+                            )
+                        continue
+                    if data == "settings:back_panel":
+                        if message_id:
+                            tg_edit_message(
+                                build_settings_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=settings_inline_keyboard(),
+                            )
+                        else:
+                            tg_send(
+                                build_settings_text(state),
+                                chat_id=chat_id,
+                                reply_markup=settings_inline_keyboard(),
+                            )
+                        continue
+                    if data == "settings:back":
+                        if message_id:
+                            tg_edit_message(
+                                "✅ Настройки закрыты",
+                                chat_id,
+                                message_id,
+                                reply_markup={"inline_keyboard": []},
+                            )
+                        else:
+                            tg_send("✅ Настройки закрыты", chat_id=chat_id)
+                        continue
+                    if data.startswith("settings:coin:"):
+                        symbol_code = data.split(":", 2)[-1]
+                        if symbol_code in ALL_SYMBOLS:
+                            with state_lock:
+                                settings = ensure_settings(state)
+                                coins = settings.setdefault("coins", {})
+                                coins[symbol_code] = not coins.get(symbol_code, True)
+                                settings["coins"] = coins
+                                save_state(state)
+                        if message_id:
+                            tg_edit_message(
+                                build_settings_coins_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=settings_coins_inline_keyboard(state),
+                            )
+                        continue
+                    if data.startswith("settings:"):
+                        field = data.split(":", 1)[-1]
+                        if field in {"leverage", "position_usd", "min_confidence"}:
+                            with state_lock:
+                                state["awaiting_settings"] = {
+                                    "field": field,
+                                    "message_id": message_id,
+                                }
+                                save_state(state)
+                            prompt_map = {
+                                "leverage": "Введите плечо (1–125).",
+                                "position_usd": "Введите сумму сделки (число > 0).",
+                                "min_confidence": "Введите мин. уверенность (1–100).",
+                            }
+                            tg_send(prompt_map[field], chat_id=chat_id)
                         continue
                     if data == "news:show":
                         handle_command("/news", chat_id, state)
@@ -2802,6 +3077,75 @@ def command_loop(state: Dict) -> None:
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
                 with state_lock:
+                    awaiting_settings = state.get("awaiting_settings")
+                if awaiting_settings:
+                    field = awaiting_settings.get("field")
+                    message_id = awaiting_settings.get("message_id")
+                    value_text = (text or "").strip().replace(",", ".")
+                    updated = False
+                    error_message = None
+                    if field == "leverage":
+                        if value_text.isdigit():
+                            value = int(value_text)
+                            if 1 <= value <= 125:
+                                with state_lock:
+                                    settings = ensure_settings(state)
+                                    settings["leverage"] = value
+                                    save_state(state)
+                                updated = True
+                            else:
+                                error_message = "❌ Введите плечо от 1 до 125."
+                        else:
+                            error_message = "❌ Введите целое число для плеча."
+                    elif field == "position_usd":
+                        try:
+                            value = float(value_text)
+                        except ValueError:
+                            value = None
+                        if value is not None and value > 0:
+                            with state_lock:
+                                settings = ensure_settings(state)
+                                settings["position_usd"] = value
+                                save_state(state)
+                            updated = True
+                        else:
+                            error_message = "❌ Введите сумму > 0."
+                    elif field == "min_confidence":
+                        if value_text.isdigit():
+                            value = int(value_text)
+                            if 1 <= value <= 100:
+                                with state_lock:
+                                    settings = ensure_settings(state)
+                                    settings["min_confidence"] = value
+                                    state["min_confidence"] = value
+                                    save_state(state)
+                                MIN_CONFIDENCE = value
+                                updated = True
+                            else:
+                                error_message = "❌ Введите значение 1–100."
+                        else:
+                            error_message = "❌ Введите целое число 1–100."
+                    if updated:
+                        with state_lock:
+                            state["awaiting_settings"] = None
+                            save_state(state)
+                        if message_id:
+                            tg_edit_message(
+                                build_settings_text(state),
+                                chat_id,
+                                message_id,
+                                reply_markup=settings_inline_keyboard(),
+                            )
+                        else:
+                            tg_send(
+                                build_settings_text(state),
+                                chat_id=chat_id,
+                                reply_markup=settings_inline_keyboard(),
+                            )
+                    else:
+                        tg_send(error_message or "❌ Некорректное значение.", chat_id=chat_id)
+                    continue
+                with state_lock:
                     awaiting = state.get("awaiting_confidence", False)
                 if awaiting:
                     t = (text or "").strip()
@@ -2810,6 +3154,8 @@ def command_loop(state: Dict) -> None:
                         if 1 <= value <= 99:
                             MIN_CONFIDENCE = value
                             with state_lock:
+                                settings = ensure_settings(state)
+                                settings["min_confidence"] = value
                                 state["min_confidence"] = value
                                 state["awaiting_confidence"] = False
                                 save_state(state)
@@ -2898,6 +3244,7 @@ def main() -> None:
         state = load_state()
         default_confidence = MIN_CONFIDENCE
         state.setdefault("min_confidence", default_confidence)
+        state.setdefault("awaiting_settings", None)
         state.setdefault("awaiting_confidence", False)
         state.setdefault("paused", False)
         state.setdefault("last_signal", None)
@@ -2921,10 +3268,12 @@ def main() -> None:
         state.setdefault("news_translate_cache", {})
         state.setdefault("news_price_last_check", {})
         state.setdefault("news_last_poll_ts", 0)
+        settings = ensure_settings(state)
         try:
-            MIN_CONFIDENCE = int(state.get("min_confidence", default_confidence))
+            MIN_CONFIDENCE = int(settings.get("min_confidence", default_confidence))
         except (TypeError, ValueError):
             MIN_CONFIDENCE = default_confidence
+            settings["min_confidence"] = default_confidence
             state["min_confidence"] = default_confidence
         save_state(state)
 
@@ -2935,7 +3284,7 @@ def main() -> None:
     )
     tg_send(
         "◉ СИСТЕМА ЗАПУЩЕНА\n\n"
-        f"🧠 Анализ активов: {len(SYMBOLS)}\n"
+        f"🧠 Анализ активов: {len(get_enabled_symbol_codes(state))}\n"
         f"⏱ Таймфрейм: {TIMEFRAME}\n"
         f"📊 Минимальная уверенность: {MIN_CONFIDENCE}%\n"
         f"🛡 Антиспам: {COOLDOWN_MINUTES} мин"
