@@ -175,6 +175,26 @@ def _min_rr(leverage: int) -> float:
     return 2.2
 
 
+def _liq_haircut(leverage: int) -> float:
+    if leverage <= 10:
+        return 0.90
+    if leverage <= 25:
+        return 0.80
+    if leverage <= 50:
+        return 0.65
+    return 0.60
+
+
+def _liq_buffer_pct(leverage: int) -> float:
+    if leverage <= 10:
+        return 0.15
+    if leverage <= 25:
+        return 0.22
+    if leverage <= 50:
+        return 0.30
+    return 0.35
+
+
 def evaluate_risk(
     direction: str,
     entry_price: float,
@@ -206,8 +226,15 @@ def evaluate_risk(
         }
 
     is_long = direction.upper() == "LONG"
-    liq_price = entry_price * (1 - 1 / leverage) if is_long else entry_price * (1 + 1 / leverage)
-    liq_distance = abs(entry_price - liq_price)
+
+    # 1) теоретическая ликвидация
+    theo_liq_price = entry_price * (1 - 1 / leverage) if is_long else entry_price * (1 + 1 / leverage)
+    theo_liq_distance = abs(entry_price - theo_liq_price)
+
+    # 2) консервативная поправка, чтобы ликвидация была ближе к входу (как на Bybit)
+    haircut = _liq_haircut(leverage)
+    liq_distance = theo_liq_distance * haircut
+    liq_price = (entry_price - liq_distance) if is_long else (entry_price + liq_distance)
     if liq_distance <= 0:
         return {
             "ok": False,
@@ -219,7 +246,7 @@ def evaluate_risk(
             "reason": "недостаточная дистанция до ликвидации",
         }
 
-    buffer_distance = liq_distance * 0.15
+    buffer_distance = liq_distance * _liq_buffer_pct(leverage)
     min_distance = max(atr * 0.2, liq_distance * 0.1)
     max_distance = liq_distance * 0.85
     if is_long:
@@ -262,6 +289,20 @@ def evaluate_risk(
 
     sl = min(valid_candidates, key=lambda value: abs(entry_price - value))
     risk_distance = abs(entry_price - sl)
+
+    # Жёсткий safety-check: SL должен быть на достаточной дистанции от ликвидации
+    sl_to_liq = abs(sl - liq_price)
+    min_sl_to_liq = max(atr * 0.40, liq_distance * 0.25)
+    if sl_to_liq < min_sl_to_liq:
+        return {
+            "ok": False,
+            "sl": None,
+            "tp": None,
+            "liq_price": liq_price,
+            "risk_usd": 0.0,
+            "profit_usd": 0.0,
+            "reason": "SL слишком близко к ликвидации для выбранного плеча",
+        }
     rr = _min_rr(leverage)
     if is_long:
         tp = entry_price + risk_distance * rr
