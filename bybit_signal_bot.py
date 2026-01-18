@@ -17,6 +17,8 @@ import ccxt
 import pandas as pd
 import requests
 
+from probability_engine import get_probability, make_key
+
 # ================== ТВОИ ДАННЫЕ ==================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = 5878255923
@@ -27,6 +29,10 @@ BYBIT_API_SECRET = ""
 
 
 # ================== НАСТРОЙКИ ==================
+# 2 = ENGINE_V2 (legacy)
+# 3 = ENGINE_V3 (analytical core)
+ENGINE_VERSION = 3
+
 ALL_SYMBOLS = [
     "BTCUSDT",
     "ETHUSDT",
@@ -100,6 +106,14 @@ ENGINE_V2_USE_MTF = True
 ENGINE_V2_USE_LIVE_TRIGGER = True
 ENGINE_V2_SETUP_ENABLED = True
 ENGINE_V2_ENTRY_ENABLED = True
+
+# Engine v3 gates
+ENGINE_V3_MIN_CANDLES = 200
+ENGINE_V3_DATA_STALE_MULTIPLIER = 3
+ENGINE_V3_ANOMALY_RANGE_MULT = 15
+ENGINE_V3_MAX_GAP_PCT = 0.2
+ENGINE_V3_MAX_SPREAD_PCT = 0.25
+ENGINE_V3_CORR_THRESHOLD = 0.9
 
 # Timeframes
 BASE_TIMEFRAME = TIMEFRAME
@@ -992,7 +1006,9 @@ class ManualMemoryEngine:
     def run_one_off_analysis(self, symbol: str) -> Dict:
         ccxt_symbol = to_ccxt_manual_symbol(symbol)
         try:
-            if ENGINE_V2_ENABLED:
+            if ENGINE_VERSION == 3:
+                return engine_v3_analyze(self.exchange, self._get_state(), ccxt_symbol)
+            if ENGINE_VERSION == 2:
                 base_parsed = fetch_ohlcv_cached(
                     self.exchange,
                     ccxt_symbol,
@@ -1068,33 +1084,7 @@ class ManualMemoryEngine:
                     return {"status": "entry", "message": message}
                 best_setup = max(setups, key=lambda item: item.get("setup_score", 0))
                 return {"status": "setup", "message": format_setup_message(best_setup)}
-            parsed = fetch_ohlcv_cached(
-                self.exchange,
-                ccxt_symbol,
-                TIMEFRAME,
-                limit=300,
-                ttl_seconds=25,
-            )
-            if not parsed:
-                return {"status": "error", "error": "Данные недоступны."}
-            highs, lows, closes, volumes, _ = parsed
-            signal, info = compute_signal(highs, lows, closes, volumes)
-            if not signal:
-                return {"status": "none"}
-            direction = "LONG" if signal == "UP" else "SHORT"
-            display_probability = compute_display_probability(None, info)
-            pair_text = f"{normalize_symbol(ccxt_symbol)} / {MANUAL_SYMBOL_QUOTE}"
-            message = (
-                "🔍 Анализ\n"
-                "━━━━━━━━━━━━━━━━\n"
-                f"🪙 Пара: {pair_text}\n"
-                f"📍 Направление: {'ВВЕРХ ⬆️' if direction == 'LONG' else 'ВНИЗ ⬇️'}\n"
-                f"💰 Цена: {format_price(info.get('price'))}\n"
-                "🎯 Вероятность\n"
-                f"{probability_bar(display_probability)} {display_probability*100:.2f}%\n"
-                "━━━━━━━━━━━━━━━━"
-            )
-            return {"status": "entry", "message": message}
+            return {"status": "none"}
         except Exception as e:
             self._log(f"[MANUAL] analysis error: {e}")
             return {"status": "error", "error": "Ошибка анализа."}
@@ -2443,6 +2433,74 @@ def fetch_ohlcv_raw_cached(
     return cached.get("ohlcv")  # type: ignore[return-value]
 
 
+def timeframe_to_seconds(timeframe: str) -> int:
+    match = re.match(r"^(\d+)([mhd])$", timeframe)
+    if not match:
+        return 0
+    value = int(match.group(1))
+    unit = match.group(2)
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 3600
+    if unit == "d":
+        return value * 86400
+    return 0
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    values_sorted = sorted(values)
+    mid = len(values_sorted) // 2
+    if len(values_sorted) % 2 == 0:
+        return (values_sorted[mid - 1] + values_sorted[mid]) / 2
+    return values_sorted[mid]
+
+
+def _has_anomalies(base_data: Dict[str, List[float]]) -> bool:
+    highs = base_data.get("highs", [])
+    lows = base_data.get("lows", [])
+    closes = base_data.get("closes", [])
+    if not highs or not lows or not closes:
+        return True
+    if any(value <= 0 for value in highs + lows + closes):
+        return True
+    ranges = []
+    for high, low, close in zip(highs, lows, closes):
+        if high < low:
+            return True
+        if not (low <= close <= high):
+            return True
+        ranges.append(high - low)
+    median_range = _median(ranges[-ENGINE_V3_MIN_CANDLES:])
+    if median_range <= 0:
+        return True
+    if max(ranges[-ENGINE_V3_MIN_CANDLES:]) > median_range * ENGINE_V3_ANOMALY_RANGE_MULT:
+        return True
+    for prev, current in zip(closes[-ENGINE_V3_MIN_CANDLES:-1], closes[-ENGINE_V3_MIN_CANDLES + 1:]):
+        if prev <= 0:
+            return True
+        if abs(current - prev) / prev > ENGINE_V3_MAX_GAP_PCT:
+            return True
+    return False
+
+
+def data_integrity_gate(symbol: str, base_data: Dict[str, List[float]], timeframe_seconds: int) -> Tuple[bool, str]:
+    closes = base_data.get("closes", [])
+    timestamps = base_data.get("timestamps", [])
+    if len(closes) < ENGINE_V3_MIN_CANDLES:
+        return False, "insufficient_candles"
+    if not timestamps:
+        return False, "missing_timestamps"
+    last_ts = timestamps[-1] / 1000
+    if timeframe_seconds and (time.time() - last_ts) > timeframe_seconds * ENGINE_V3_DATA_STALE_MULTIPLIER:
+        return False, "stale_data"
+    if _has_anomalies(base_data):
+        return False, "anomalous_candles"
+    return True, "ok"
+
+
 def get_live_price_if_needed(
     exchange: ccxt.bybit,
     symbol: str,
@@ -3165,14 +3223,394 @@ def compute_signal(
     return None, {}
 
 
+def _append_decision_log(state: Dict, payload: Dict) -> None:
+    with state_lock:
+        log = state.setdefault("decision_log", [])
+        log.append(payload)
+        if len(log) > 200:
+            del log[:-200]
+        state["decision_log"] = log
+
+
+def _compute_returns(closes: List[float], window: int = 120) -> List[float]:
+    if len(closes) < window + 1:
+        return []
+    sliced = closes[-(window + 1):]
+    returns = []
+    for prev, current in zip(sliced[:-1], sliced[1:]):
+        if prev <= 0:
+            return []
+        returns.append((current - prev) / prev)
+    return returns
+
+
+def _pearson_corr(values_a: List[float], values_b: List[float]) -> Optional[float]:
+    if not values_a or not values_b or len(values_a) != len(values_b):
+        return None
+    n = len(values_a)
+    mean_a = sum(values_a) / n
+    mean_b = sum(values_b) / n
+    cov = sum((a - mean_a) * (b - mean_b) for a, b in zip(values_a, values_b))
+    var_a = sum((a - mean_a) ** 2 for a in values_a)
+    var_b = sum((b - mean_b) ** 2 for b in values_b)
+    if var_a == 0 or var_b == 0:
+        return None
+    return cov / (var_a ** 0.5 * var_b ** 0.5)
+
+
+def _fetch_btc_context(exchange: ccxt.bybit) -> Optional[Dict]:
+    btc_symbol = to_ccxt_symbol("BTCUSDT")
+    base_parsed = fetch_ohlcv_cached(exchange, btc_symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
+    if not base_parsed:
+        return None
+    base_data = _parsed_to_dict(base_parsed)
+    timeframe_seconds = timeframe_to_seconds(BASE_TIMEFRAME)
+    ok, _ = data_integrity_gate(btc_symbol, base_data, timeframe_seconds)
+    if not ok:
+        return None
+    features = build_features(base_data)
+    if not features:
+        return None
+    regime = detect_regime(features)
+    return {
+        "symbol": btc_symbol,
+        "data": base_data,
+        "features": features,
+        "regime": regime,
+    }
+
+
+def _passes_correlation_gate(
+    symbol: str,
+    direction: str,
+    base_data: Dict[str, List[float]],
+    btc_context: Optional[Dict],
+) -> Tuple[bool, str]:
+    if normalize_symbol(symbol) == "BTC":
+        return True, "btc_self"
+    if not btc_context:
+        return False, "btc_context_missing"
+    btc_closes = btc_context["data"].get("closes", [])
+    symbol_returns = _compute_returns(base_data.get("closes", []))
+    btc_returns = _compute_returns(btc_closes)
+    if not symbol_returns or not btc_returns:
+        return False, "returns_missing"
+    corr = _pearson_corr(symbol_returns, btc_returns)
+    if corr is None:
+        return False, "corr_missing"
+    btc_regime = btc_context.get("regime")
+    btc_trend = None
+    if btc_regime == "TREND_UP":
+        btc_trend = "LONG"
+    elif btc_regime == "TREND_DOWN":
+        btc_trend = "SHORT"
+    if abs(corr) >= ENGINE_V3_CORR_THRESHOLD:
+        if btc_regime in {"CHOP", "HIGH_VOLATILITY", "LOW_VOLATILITY"}:
+            return False, f"btc_regime_{btc_regime.lower()}"
+        if btc_trend and btc_trend != direction:
+            return False, "btc_trend_conflict"
+    return True, f"corr_{corr:.2f}"
+
+
+def _passes_spread_gate(exchange: ccxt.bybit, symbol: str) -> Tuple[bool, str]:
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            _log_rate_limit_once(f"fetch_ticker {symbol}")
+        return False, "ticker_unavailable"
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    if bid is None or ask is None:
+        return False, "spread_missing"
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return False, "spread_invalid"
+    spread_pct = (ask - bid) / mid * 100
+    if spread_pct > ENGINE_V3_MAX_SPREAD_PCT:
+        return False, f"spread_{spread_pct:.2f}"
+    return True, f"spread_{spread_pct:.2f}"
+
+
+def _compute_probability(
+    symbol: str,
+    direction: str,
+    confidence: float,
+    regime: str,
+    risk_result: Dict,
+) -> float:
+    side = "LONG" if direction == "LONG" else "SHORT"
+    key = make_key(symbol, BASE_TIMEFRAME, side)
+    stat_prob = get_probability(key)
+    if stat_prob is not None:
+        return min(stat_prob * 100, 99.99)
+    rr = 0.0
+    if risk_result.get("risk_usd", 0) > 0:
+        rr = risk_result.get("profit_usd", 0) / risk_result.get("risk_usd", 0)
+    regime_bonus = 0.0
+    if regime in {"TREND_UP", "TREND_DOWN"}:
+        regime_bonus = 6
+    if regime == "RANGE":
+        regime_bonus = -4
+    model_prob = clamp((confidence + regime_bonus + min(rr * 5, 12)), 55, 95)
+    return min(model_prob, 99.99)
+
+
+def engine_v3_analyze(exchange: ccxt.bybit, state: Dict, symbol: str) -> Dict:
+    timeframe_seconds = timeframe_to_seconds(BASE_TIMEFRAME)
+    base_parsed = fetch_ohlcv_cached(exchange, symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
+    if not base_parsed:
+        return {"status": "error", "error": "Данные недоступны."}
+    base_data = _parsed_to_dict(base_parsed)
+    ok, reason = data_integrity_gate(symbol, base_data, timeframe_seconds)
+    if not ok:
+        return {"status": "none", "reason": reason}
+    higher_data = None
+    if ENGINE_V2_USE_MTF:
+        higher_parsed = fetch_ohlcv_cached(exchange, symbol, HIGHER_TIMEFRAME, limit=300, ttl_seconds=600)
+        higher_data = _parsed_to_dict(higher_parsed) if higher_parsed else None
+    features = build_features(base_data)
+    if not features:
+        return {"status": "none"}
+    regime = detect_regime(features)
+    setups = generate_setups(symbol, base_data, higher_data, features, regime) if ENGINE_V2_SETUP_ENABLED else []
+    if not setups:
+        return {"status": "none"}
+    live_price = get_live_price_if_needed(
+        exchange,
+        symbol,
+        base_data["closes"][-1],
+        has_active_setup=True,
+    )
+    if live_price is None:
+        return {"status": "error", "error": "Не удалось получить цену."}
+    best_entry = None
+    for setup in setups:
+        entry = check_trigger(setup, live_price, base_data, features)
+        if not entry:
+            continue
+        if not best_entry or entry["confidence"] > best_entry["entry"]["confidence"]:
+            best_entry = {"setup": setup, "entry": entry}
+    if not best_entry:
+        return {"status": "none"}
+    if regime in {"CHOP", "HIGH_VOLATILITY"}:
+        return {"status": "none"}
+    btc_context = _fetch_btc_context(exchange)
+    corr_ok, _ = _passes_correlation_gate(symbol, best_entry["setup"]["direction"], base_data, btc_context)
+    if not corr_ok:
+        return {"status": "none"}
+    spread_ok, _ = _passes_spread_gate(exchange, symbol)
+    if not spread_ok:
+        return {"status": "none"}
+    settings = get_settings_snapshot(state)
+    atr_val = features.get("atr")
+    lows = base_data["lows"]
+    highs = base_data["highs"]
+    swing_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+    swing_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+    risk_result = evaluate_risk(
+        direction=best_entry["setup"]["direction"],
+        entry_price=best_entry["entry"]["entry_price"],
+        atr=atr_val,
+        swing_high=swing_high,
+        swing_low=swing_low,
+        leverage=int(settings["leverage"]),
+        position_usd=float(settings["position_usd"]),
+    )
+    if not risk_result.get("ok"):
+        return {"status": "none"}
+    probability = _compute_probability(
+        symbol,
+        best_entry["setup"]["direction"],
+        best_entry["entry"]["confidence"],
+        regime,
+        risk_result,
+    )
+    pair_text = f"{normalize_symbol(symbol)} / {MANUAL_SYMBOL_QUOTE}"
+    message = (
+        "🔍 Анализ\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"🪙 Пара: {pair_text}\n"
+        f"📍 Направление: {'ВВЕРХ ⬆️' if best_entry['setup']['direction'] == 'LONG' else 'ВНИЗ ⬇️'}\n"
+        f"💰 Цена: {format_price(best_entry['entry']['entry_price'])}\n"
+        "🎯 Вероятность\n"
+        f"{probability_bar(probability / 100)} {probability:.2f}%\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+    return {"status": "entry", "message": message}
+
+
+def engine_v3_cycle(
+    exchange: ccxt.bybit,
+    state: Dict,
+    send_signals: bool,
+    allow_cooldown: bool,
+) -> Optional[Dict]:
+    last_signal = None
+    cleanup_open_setups(state)
+    settings_snapshot = get_settings_snapshot(state)
+    min_confidence = int(settings_snapshot["min_confidence"])
+    leverage_value = int(settings_snapshot["leverage"])
+    position_usd = float(settings_snapshot["position_usd"])
+    enabled_symbols = get_combined_symbols(state)
+    timeframe_seconds = timeframe_to_seconds(BASE_TIMEFRAME)
+    btc_context = _fetch_btc_context(exchange)
+    candidates = []
+
+    for symbol in enabled_symbols:
+        base_parsed = fetch_ohlcv_cached(exchange, symbol, BASE_TIMEFRAME, limit=300, ttl_seconds=25)
+        if not base_parsed:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "data", "reason": "no_ohlcv"})
+            continue
+        base_data = _parsed_to_dict(base_parsed)
+        ok, reason = data_integrity_gate(symbol, base_data, timeframe_seconds)
+        if not ok:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "gate", "reason": reason})
+            continue
+        higher_data = None
+        if ENGINE_V2_USE_MTF:
+            higher_parsed = fetch_ohlcv_cached(exchange, symbol, HIGHER_TIMEFRAME, limit=300, ttl_seconds=600)
+            higher_data = _parsed_to_dict(higher_parsed) if higher_parsed else None
+        features = build_features(base_data)
+        if not features:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "features", "reason": "empty"})
+            continue
+        regime = detect_regime(features)
+        setups = generate_setups(symbol, base_data, higher_data, features, regime) if ENGINE_V2_SETUP_ENABLED else []
+        if not setups:
+            continue
+        live_price = get_live_price_if_needed(
+            exchange,
+            symbol,
+            base_data["closes"][-1],
+            has_active_setup=True,
+        )
+        if live_price is None:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "price", "reason": "unavailable"})
+            continue
+        for setup in setups:
+            entry = check_trigger(setup, live_price, base_data, features)
+            if not entry:
+                continue
+            if entry["confidence"] < min_confidence:
+                continue
+            entry_key = f"{symbol}_{setup['direction']}"
+            with state_lock:
+                entry_memory = state.setdefault("entry_memory", {})
+                last_entry_time = entry_memory.get(entry_key, 0)
+            if allow_cooldown and time.time() - last_entry_time < COOLDOWN_MINUTES * 60:
+                continue
+            candidates.append({
+                "symbol": symbol,
+                "direction": setup["direction"],
+                "entry": entry,
+                "features": features,
+                "regime": regime,
+                "base_data": base_data,
+            })
+
+    if not candidates:
+        return last_signal
+
+    vetted_candidates = []
+    for candidate in candidates:
+        symbol = candidate["symbol"]
+        direction = candidate["direction"]
+        entry = candidate["entry"]
+        regime = candidate["regime"]
+        base_data = candidate["base_data"]
+
+        if regime in {"CHOP", "HIGH_VOLATILITY"}:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "regime", "reason": regime})
+            continue
+        corr_ok, corr_reason = _passes_correlation_gate(symbol, direction, base_data, btc_context)
+        if not corr_ok:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "correlation", "reason": corr_reason})
+            continue
+        spread_ok, spread_reason = _passes_spread_gate(exchange, symbol)
+        if not spread_ok:
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "spread", "reason": spread_reason})
+            continue
+
+        atr_val = candidate["features"].get("atr")
+        lows = base_data["lows"]
+        highs = base_data["highs"]
+        swing_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+        swing_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+        risk_result = evaluate_risk(
+            direction=direction,
+            entry_price=entry["entry_price"],
+            atr=atr_val,
+            swing_high=swing_high,
+            swing_low=swing_low,
+            leverage=leverage_value,
+            position_usd=position_usd,
+        )
+        if not risk_result.get("ok"):
+            _append_decision_log(state, {"ts": time.time(), "symbol": symbol, "stage": "risk", "reason": risk_result.get("reason")})
+            continue
+        probability = _compute_probability(symbol, direction, entry["confidence"], regime, risk_result)
+        rr = 0.0
+        if risk_result.get("risk_usd", 0) > 0:
+            rr = risk_result.get("profit_usd", 0) / risk_result.get("risk_usd", 0)
+        score = entry["confidence"] + (probability / 4) + min(rr * 5, 12)
+        vetted_candidates.append({
+            **candidate,
+            "risk_result": risk_result,
+            "probability": probability,
+            "score": score,
+        })
+
+    if not vetted_candidates:
+        return last_signal
+
+    best = max(vetted_candidates, key=lambda item: item["score"])
+    symbol = best["symbol"]
+    direction = best["direction"]
+    entry = best["entry"]
+    risk_result = best["risk_result"]
+    probability = best["probability"]
+
+    if send_signals:
+        tg_send(format_entry_message(symbol, direction, entry, risk_result, settings_snapshot))
+
+    last_signal = {
+        "pair": normalize_symbol(symbol),
+        "direction": "UP" if direction == "LONG" else "DOWN",
+        "confidence": round(entry["confidence"]),
+        "probability": round(probability, 2),
+        "price": entry["entry_price"],
+        "timestamp": int(time.time()),
+    }
+    with state_lock:
+        entry_memory = state.setdefault("entry_memory", {})
+        entry_memory[f"{symbol}_{direction}"] = time.time()
+        state["entry_memory"] = entry_memory
+        state["last_signal"] = last_signal
+        save_state(state)
+    _append_decision_log(
+        state,
+        {
+            "ts": time.time(),
+            "symbol": symbol,
+            "stage": "select",
+            "reason": "best_candidate",
+            "score": best["score"],
+        },
+    )
+    return last_signal
+
+
 def run_signal_cycle(
     exchange: ccxt.bybit,
     state: Dict,
     send_signals: bool,
     allow_cooldown: bool = True,
 ) -> Optional[Dict]:
-    if ENGINE_V2_ENABLED:
+    if ENGINE_VERSION == 2:
         return engine_v2_cycle(exchange, state, send_signals, allow_cooldown)
+    if ENGINE_VERSION == 3:
+        return engine_v3_cycle(exchange, state, send_signals, allow_cooldown)
 
     last_signal = None
     candidates = []
@@ -4031,6 +4469,7 @@ def main() -> None:
         state.setdefault("setup_memory", {})
         state.setdefault("entry_memory", {})
         state.setdefault("open_setups", {})
+        state.setdefault("decision_log", [])
         state.setdefault("engine_config_version", 1)
         state.setdefault("news", [])
         state.setdefault("news_seen", {})
@@ -4060,7 +4499,7 @@ def main() -> None:
 
     # Сообщение при старте (должно прийти всегда)
     print(
-        f"[ENGINE] v2={ENGINE_V2_ENABLED} base_tf={BASE_TIMEFRAME} "
+        f"[ENGINE] v{ENGINE_VERSION} base_tf={BASE_TIMEFRAME} "
         f"mtf={ENGINE_V2_USE_MTF} higher_tf={HIGHER_TIMEFRAME}"
     )
     tg_send(
